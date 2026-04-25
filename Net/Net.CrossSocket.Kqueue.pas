@@ -286,6 +286,7 @@ end;
 destructor TKqueueConnection.Destroy;
 begin
   _ClearSendQueue;
+  FreeAndNil(FSendQueue);
 
   inherited;
 end;
@@ -319,8 +320,6 @@ begin
 
       FSendQueue.Clear;
     end;
-
-    FreeAndNil(FSendQueue);
   finally
     _KqUnlock;
   end;
@@ -498,15 +497,16 @@ procedure TKqueueCrossSocket._HandleConnect(const AConnection: ICrossConnection)
 var
   LConnection: ICrossConnection;
   LKqConnection: TKqueueConnection;
+  LSockErr: Integer;
 begin
   LConnection := AConnection;
 
   // Connect失败
-  if (TSocketAPI.GetError(LConnection.Socket) <> 0) then
+  LSockErr := TSocketAPI.GetError(LConnection.Socket);
+  if (LSockErr <> 0) then
   begin
-    {$IFDEF DEBUG}
-    _LogLastOsError;
-    {$ENDIF}
+    LConnection.LastNetError := LSockErr;
+    _LogLastOsError(Self.ClassName + '._HandleConnect.GetError');
     LConnection.Close;
     Exit;
   end;
@@ -604,7 +604,7 @@ begin
     while True do
     begin
       // 检查队列中有没有数据
-      if (LKqConnection.FSendQueue.Count <= 0) then Break;
+      if (LKqConnection.FSendQueue = nil) or (LKqConnection.FSendQueue.Count <= 0) then Break;
 
       // 获取Socket发送队列中的第一条数据
       LSendItem := LKqConnection.FSendQueue.Items[0];
@@ -671,7 +671,7 @@ begin
 
   LKqConnection._KqLock;
   try
-    if (LKqConnection.FSendQueue.Count > 0) then
+    if (LKqConnection.FSendQueue <> nil) and (LKqConnection.FSendQueue.Count > 0) then
       LKqConnection._UpdateIoEvent([ieWrite]);
   finally
     LKqConnection._KqUnlock;
@@ -811,7 +811,6 @@ procedure TKqueueCrossSocket.Connect(const AHost: string;
         if not LKqConnection._UpdateIoEvent([ieWrite]) then
         begin
           LConnection.Close;
-          _Failed2;
           Exit(False);
         end;
       finally

@@ -428,22 +428,26 @@ begin
     end;
 
     if not LSuccess then
+    begin
+      _Log('_HandleAccept._UpdateIoEvent failed, %s', [LConnection.DebugInfo]);
       LConnection.Close;
+    end;
   end;
 end;
 
 procedure TEpollCrossSocket._HandleConnect(const AConnection: ICrossConnection);
 var
   LConnection: ICrossConnection;
+  LSockErr: Integer;
 begin
   LConnection := AConnection;
 
   // Connect失败
-  if (TSocketAPI.GetError(LConnection.Socket) <> 0) then
+  LSockErr := TSocketAPI.GetError(LConnection.Socket);
+  if (LSockErr <> 0) then
   begin
-    {$IFDEF DEBUG}
-    _LogLastOsError;
-    {$ENDIF}
+    LConnection.LastNetError := LSockErr;
+    _LogLastOsError(Self.ClassName + '._HandleConnect.GetError');
     LConnection.Close;
     Exit;
   end;
@@ -723,7 +727,6 @@ procedure TEpollCrossSocket.Connect(const AHost: string;
         if not LEpConnection._UpdateIoEvent([ieWrite]) then
         begin
           LConnection.Close;
-          _Failed2;
           Exit(False);
         end;
       finally

@@ -63,6 +63,14 @@ type
     procedure SetCertificate(const ACertBuf: Pointer; const ACertBufSize: Integer); overload;
 
     /// <summary>
+    ///   从字节数组加载证书
+    /// </summary>
+    /// <param name="ACertBytes">
+    ///   证书字节数组
+    /// </param>
+    procedure SetCertificate(const ACertBytes: TBytes); overload;
+
+    /// <summary>
     ///   从字符串加载证书
     /// </summary>
     /// <param name="ACertStr">
@@ -88,6 +96,14 @@ type
     ///   私钥缓冲区大小
     /// </param>
     procedure SetPrivateKey(const APKeyBuf: Pointer; const APKeyBufSize: Integer); overload;
+
+    /// <summary>
+    ///   从字节数组加载私钥
+    /// </summary>
+    /// <param name="APKeyStr">
+    ///   私钥字节数组
+    /// </param>
+    procedure SetPrivateKey(const APKeyBytes: TBytes); overload;
 
     /// <summary>
     ///   从字符串加载私钥

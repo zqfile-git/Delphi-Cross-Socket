@@ -238,8 +238,10 @@ type
     function GetPeerHost: string;
     function GetConnectType: TConnectType;
     function GetConnectStatus: TConnectStatus;
+    function GetLastNetError: Integer;
 
     procedure SetConnectStatus(const AValue: TConnectStatus);
+    procedure SetLastNetError(const AValue: Integer);
 
     /// <summary>
     ///   优雅关闭
@@ -355,6 +357,15 @@ type
     ///   连接状态
     /// </summary>
     property ConnectStatus: TConnectStatus read GetConnectStatus write SetConnectStatus;
+
+    /// <summary>
+    ///   最近一次底层网络错误码(0=无错误)
+    /// </summary>
+    /// <remarks>
+    ///   由平台实现层(Iocp/Epoll/Kqueue)在 connect/send/recv 等失败路径设置,
+    ///   上层在连接失败回调中读取, 用于生成带有具体 WSA/errno 错误码的诊断日志
+    /// </remarks>
+    property LastNetError: Integer read GetLastNetError write SetLastNetError;
   end;
   TCrossConnections = TDictionary<UInt64, ICrossConnection>;
 
@@ -679,6 +690,7 @@ type
     FPeerHost: string;
     FConnectType: TConnectType;
     FConnectStatus: Integer;
+    FLastNetError: Integer;
     FRecvLock, FSentLock: ILock;
     FConnectCb: TCrossConnectionCallback;
   protected
@@ -694,10 +706,12 @@ type
     function GetPeerHost: string;
     function GetConnectType: TConnectType;
     function GetConnectStatus: TConnectStatus;
+    function GetLastNetError: Integer;
     function GetIsClosed: Boolean; override;
 
     function _SetConnectStatus(const AStatus: TConnectStatus): TConnectStatus; inline;
     procedure SetConnectStatus(const AValue: TConnectStatus);
+    procedure SetLastNetError(const AValue: Integer);
 
     procedure InternalClose; virtual;
     procedure DirectSend(const ABuffer: Pointer; const ACount: Integer;
@@ -1324,12 +1338,18 @@ end;
 
 procedure TCrossSocketBase.TriggerIoThreadBegin(const AIoThread: TIoEventThread);
 begin
+  {$IFDEF __DEBUG__}
+  _Log('[%s]thread%d start', [Self.ClassName, TThread.Current.ThreadID]);
+  {$ENDIF}
   if Assigned(FOnIoThreadBegin) then
     FOnIoThreadBegin(Self, AIoThread);
 end;
 
 procedure TCrossSocketBase.TriggerIoThreadEnd(const AIoThread: TIoEventThread);
 begin
+  {$IFDEF __DEBUG__}
+  _Log('[%s]thread%d exit', [Self.ClassName, TThread.Current.ThreadID]);
+  {$ENDIF}
   if Assigned(FOnIoThreadEnd) then
     FOnIoThreadEnd(Self, AIoThread);
 end;
@@ -1700,6 +1720,16 @@ end;
 function TCrossConnectionBase.GetConnectStatus: TConnectStatus;
 begin
   Result := TConnectStatus(AtomicCmpExchange(FConnectStatus, 0, 0));
+end;
+
+function TCrossConnectionBase.GetLastNetError: Integer;
+begin
+  Result := AtomicCmpExchange(FLastNetError, 0, 0);
+end;
+
+procedure TCrossConnectionBase.SetLastNetError(const AValue: Integer);
+begin
+  AtomicExchange(FLastNetError, AValue);
 end;
 
 function TCrossConnectionBase.GetConnectType: TConnectType;

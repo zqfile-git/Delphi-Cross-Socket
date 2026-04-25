@@ -20,7 +20,12 @@ uses
   SysUtils,
   Classes,
   Math,
+  //ZLib,
+  {$IFDEF DELPHI}
   ZLib,
+  {$ELSE}
+  DTF.StaticZLib,
+  {$ENDIF}
 
   Net.CrossHttpUtils,
 
@@ -39,7 +44,48 @@ type
   TOnParseSuccess = procedure of object;
   TOnParseFailed = procedure(const ACode: Integer; const AError: string) of object;
 
-  TCrossHttpParser = class
+  ICrossHttpParser = interface
+  ['{A7E3F8D1-6B2C-4A9E-B5D7-1F0E8C3A2B4D}']
+    procedure Decode(var ABuf: Pointer; var ALen: Integer);
+    procedure Finish;
+    procedure SetNoBody(const AValue: Boolean);
+
+    function GetMaxHeaderSize: Integer;
+    procedure SetMaxHeaderSize(const AValue: Integer);
+    function GetMaxBodyDataSize: Integer;
+    procedure SetMaxBodyDataSize(const AValue: Integer);
+
+    function GetOnHeaderData: TOnHeaderData;
+    procedure SetOnHeaderData(const AValue: TOnHeaderData);
+    function GetOnGetHeaderValue: TOnGetHeaderValue;
+    procedure SetOnGetHeaderValue(const AValue: TOnGetHeaderValue);
+    function GetOnBodyBegin: TOnBodyBegin;
+    procedure SetOnBodyBegin(const AValue: TOnBodyBegin);
+    function GetOnBodyData: TOnBodyData;
+    procedure SetOnBodyData(const AValue: TOnBodyData);
+    function GetOnBodyEnd: TOnBodyEnd;
+    procedure SetOnBodyEnd(const AValue: TOnBodyEnd);
+    function GetOnParseBegin: TOnParseBegin;
+    procedure SetOnParseBegin(const AValue: TOnParseBegin);
+    function GetOnParseSuccess: TOnParseSuccess;
+    procedure SetOnParseSuccess(const AValue: TOnParseSuccess);
+    function GetOnParseFailed: TOnParseFailed;
+    procedure SetOnParseFailed(const AValue: TOnParseFailed);
+
+    property MaxHeaderSize: Integer read GetMaxHeaderSize write SetMaxHeaderSize;
+    property MaxBodyDataSize: Integer read GetMaxBodyDataSize write SetMaxBodyDataSize;
+
+    property OnHeaderData: TOnHeaderData read GetOnHeaderData write SetOnHeaderData;
+    property OnGetHeaderValue: TOnGetHeaderValue read GetOnGetHeaderValue write SetOnGetHeaderValue;
+    property OnBodyBegin: TOnBodyBegin read GetOnBodyBegin write SetOnBodyBegin;
+    property OnBodyData: TOnBodyData read GetOnBodyData write SetOnBodyData;
+    property OnBodyEnd: TOnBodyEnd read GetOnBodyEnd write SetOnBodyEnd;
+    property OnParseBegin: TOnParseBegin read GetOnParseBegin write SetOnParseBegin;
+    property OnParseSuccess: TOnParseSuccess read GetOnParseSuccess write SetOnParseSuccess;
+    property OnParseFailed: TOnParseFailed read GetOnParseFailed write SetOnParseFailed;
+  end;
+
+  TCrossHttpParser = class(TInterfacedObject, ICrossHttpParser)
   private
     FMode: TCrossHttpParseMode;
     FMaxHeaderSize, FMaxBodyDataSize: Integer;
@@ -61,7 +107,7 @@ type
     FCRCount, FLFCount: Integer;
     FHeaderStream, FChunkSizeStream: TMemoryStream;
     FChunkSize, FChunkLeftSize: Integer;
-    FHasBody: Boolean;
+    FHasBody, FNoBody: Boolean;
 
     // 动态解压
     FZCompressed: Boolean;
@@ -81,23 +127,47 @@ type
     procedure _OnParseFailed(const ACode: Integer; const AError: string);
 
     procedure _Reset;
+  protected
+    function GetMaxHeaderSize: Integer;
+    procedure SetMaxHeaderSize(const AValue: Integer);
+    function GetMaxBodyDataSize: Integer;
+    procedure SetMaxBodyDataSize(const AValue: Integer);
+
+    function GetOnHeaderData: TOnHeaderData;
+    procedure SetOnHeaderData(const AValue: TOnHeaderData);
+    function GetOnGetHeaderValue: TOnGetHeaderValue;
+    procedure SetOnGetHeaderValue(const AValue: TOnGetHeaderValue);
+    function GetOnBodyBegin: TOnBodyBegin;
+    procedure SetOnBodyBegin(const AValue: TOnBodyBegin);
+    function GetOnBodyData: TOnBodyData;
+    procedure SetOnBodyData(const AValue: TOnBodyData);
+    function GetOnBodyEnd: TOnBodyEnd;
+    procedure SetOnBodyEnd(const AValue: TOnBodyEnd);
+    function GetOnParseBegin: TOnParseBegin;
+    procedure SetOnParseBegin(const AValue: TOnParseBegin);
+    function GetOnParseSuccess: TOnParseSuccess;
+    procedure SetOnParseSuccess(const AValue: TOnParseSuccess);
+    function GetOnParseFailed: TOnParseFailed;
+    procedure SetOnParseFailed(const AValue: TOnParseFailed);
   public
     constructor Create(const AMode: TCrossHttpParseMode);
     destructor Destroy; override;
 
     procedure Decode(var ABuf: Pointer; var ALen: Integer);
+    procedure Finish;
+    procedure SetNoBody(const AValue: Boolean);
 
-    property MaxHeaderSize: Integer read FMaxHeaderSize write FMaxHeaderSize;
-    property MaxBodyDataSize: Integer read FMaxBodyDataSize write FMaxBodyDataSize;
+    property MaxHeaderSize: Integer read GetMaxHeaderSize write SetMaxHeaderSize;
+    property MaxBodyDataSize: Integer read GetMaxBodyDataSize write SetMaxBodyDataSize;
 
-    property OnHeaderData: TOnHeaderData read FOnHeaderData write FOnHeaderData;
-    property OnGetHeaderValue: TOnGetHeaderValue read FOnGetHeaderValue write FOnGetHeaderValue;
-    property OnBodyBegin: TOnBodyBegin read FOnBodyBegin write FOnBodyBegin;
-    property OnBodyData: TOnBodyData read FOnBodyData write FOnBodyData;
-    property OnBodyEnd: TOnBodyEnd read FOnBodyEnd write FOnBodyEnd;
-    property OnParseBegin: TOnParseBegin read FOnParseBegin write FOnParseBegin;
-    property OnParseSuccess: TOnParseSuccess read FOnParseSuccess write FOnParseSuccess;
-    property OnParseFailed: TOnParseFailed read FOnParseFailed write FOnParseFailed;
+    property OnHeaderData: TOnHeaderData read GetOnHeaderData write SetOnHeaderData;
+    property OnGetHeaderValue: TOnGetHeaderValue read GetOnGetHeaderValue write SetOnGetHeaderValue;
+    property OnBodyBegin: TOnBodyBegin read GetOnBodyBegin write SetOnBodyBegin;
+    property OnBodyData: TOnBodyData read GetOnBodyData write SetOnBodyData;
+    property OnBodyEnd: TOnBodyEnd read GetOnBodyEnd write SetOnBodyEnd;
+    property OnParseBegin: TOnParseBegin read GetOnParseBegin write SetOnParseBegin;
+    property OnParseSuccess: TOnParseSuccess read GetOnParseSuccess write SetOnParseSuccess;
+    property OnParseFailed: TOnParseFailed read GetOnParseFailed write SetOnParseFailed;
   end;
 
 implementation
@@ -113,13 +183,7 @@ end;
 
 destructor TCrossHttpParser.Destroy;
 begin
-  // 只有 client 模式才需要在断开连接时继续处理 body 数据
-  if (FMode = pmClient) and (FParseState = psBodyData) and FHasBody then
-  begin
-    FParseState := psDone;
-    _OnBodyEnd;
-    _OnParseSuccess;
-  end;
+  Finish;
 
   FreeAndNil(FHeaderStream);
 
@@ -231,6 +295,11 @@ begin
 
               FContentLength := StrToInt64Def(LContentLength, -1);
               FIsChunked := TStrUtils.SameText(FTransferEncoding, 'chunked');
+              if FNoBody then
+              begin
+                FContentLength := 0;
+                FIsChunked := False;
+              end;
 
               // 先通过响应头中的内容大小检查下是否超大了
               if (FMaxBodyDataSize > 0) and (FContentLength > FMaxBodyDataSize) then
@@ -240,7 +309,9 @@ begin
               end;
 
               // 根据不同模式确认是否有body数据
-              if (FMode = pmServer) then
+              if FNoBody then
+                FHasBody := False
+              else if (FMode = pmServer) then
                 // server 模式要求客户端必须要传 Content-Length 或 Transfer-Encoding
                 // 才表示有 body 数据
                 FHasBody := (FContentLength > 0) or FIsChunked
@@ -414,10 +485,31 @@ begin
   except
     on e: Exception do
     begin
+      // 出错后消耗全部数据，避免调用者死循环
+      ABuf := Pointer(PByte(ABuf) + ALen);
+      ALen := 0;
+
       if not (e is EAbort) then
         _OnParseFailed(500, e.Message);
     end;
   end;
+end;
+
+procedure TCrossHttpParser.Finish;
+begin
+  if (FMode = pmClient) and (FParseState = psBodyData) and FHasBody
+    and (FContentLength < 0) and not FIsChunked then
+  begin
+    FParseState := psDone;
+    _OnBodyEnd;
+    _Reset;
+    _OnParseSuccess;
+  end;
+end;
+
+procedure TCrossHttpParser.SetNoBody(const AValue: Boolean);
+begin
+  FNoBody := AValue;
 end;
 
 procedure TCrossHttpParser._OnBodyBegin;
@@ -497,7 +589,8 @@ begin
       if (FZResult < 0) then
       begin
         FZOutSize := 0;
-        Break;
+        _OnParseFailed(400, 'inflate failed');
+        Exit;
       end;
 
       // 已解压完成的数据大小
@@ -568,6 +661,107 @@ begin
   FCRCount := 0;
   FLFCount := 0;
   FParsedBodySize := 0;
+  FNoBody := False;
+end;
+
+function TCrossHttpParser.GetMaxHeaderSize: Integer;
+begin
+  Result := FMaxHeaderSize;
+end;
+
+procedure TCrossHttpParser.SetMaxHeaderSize(const AValue: Integer);
+begin
+  FMaxHeaderSize := AValue;
+end;
+
+function TCrossHttpParser.GetMaxBodyDataSize: Integer;
+begin
+  Result := FMaxBodyDataSize;
+end;
+
+procedure TCrossHttpParser.SetMaxBodyDataSize(const AValue: Integer);
+begin
+  FMaxBodyDataSize := AValue;
+end;
+
+function TCrossHttpParser.GetOnHeaderData: TOnHeaderData;
+begin
+  Result := FOnHeaderData;
+end;
+
+procedure TCrossHttpParser.SetOnHeaderData(const AValue: TOnHeaderData);
+begin
+  FOnHeaderData := AValue;
+end;
+
+function TCrossHttpParser.GetOnGetHeaderValue: TOnGetHeaderValue;
+begin
+  Result := FOnGetHeaderValue;
+end;
+
+procedure TCrossHttpParser.SetOnGetHeaderValue(const AValue: TOnGetHeaderValue);
+begin
+  FOnGetHeaderValue := AValue;
+end;
+
+function TCrossHttpParser.GetOnBodyBegin: TOnBodyBegin;
+begin
+  Result := FOnBodyBegin;
+end;
+
+procedure TCrossHttpParser.SetOnBodyBegin(const AValue: TOnBodyBegin);
+begin
+  FOnBodyBegin := AValue;
+end;
+
+function TCrossHttpParser.GetOnBodyData: TOnBodyData;
+begin
+  Result := FOnBodyData;
+end;
+
+procedure TCrossHttpParser.SetOnBodyData(const AValue: TOnBodyData);
+begin
+  FOnBodyData := AValue;
+end;
+
+function TCrossHttpParser.GetOnBodyEnd: TOnBodyEnd;
+begin
+  Result := FOnBodyEnd;
+end;
+
+procedure TCrossHttpParser.SetOnBodyEnd(const AValue: TOnBodyEnd);
+begin
+  FOnBodyEnd := AValue;
+end;
+
+function TCrossHttpParser.GetOnParseBegin: TOnParseBegin;
+begin
+  Result := FOnParseBegin;
+end;
+
+procedure TCrossHttpParser.SetOnParseBegin(const AValue: TOnParseBegin);
+begin
+  FOnParseBegin := AValue;
+end;
+
+function TCrossHttpParser.GetOnParseSuccess: TOnParseSuccess;
+begin
+  Result := FOnParseSuccess;
+end;
+
+procedure TCrossHttpParser.SetOnParseSuccess(const AValue: TOnParseSuccess);
+begin
+  FOnParseSuccess := AValue;
+end;
+
+function TCrossHttpParser.GetOnParseFailed: TOnParseFailed;
+begin
+  Result := FOnParseFailed;
+end;
+
+procedure TCrossHttpParser.SetOnParseFailed(const AValue: TOnParseFailed);
+begin
+  FOnParseFailed := AValue;
 end;
 
 end.

@@ -33,8 +33,13 @@ uses
   Generics.Defaults,
   Generics.Collections,
 
-  {$IFDEF MSWINDOWS}
+  {$IF defined(MSWINDOWS)}
   Windows,
+  {$ELSEIF defined(DELPHI)}
+  Posix.Unistd,
+  {$ELSE FPC}
+  baseunix,
+  unix,
   {$ENDIF}
 
   Utils.AnonymousThread;
@@ -45,12 +50,18 @@ type
   TConstProc<T1,T2> = reference to procedure (const Arg1: T1; const Arg2: T2);
   TConstProc<T1,T2,T3> = reference to procedure (const Arg1: T1; const Arg2: T2; const Arg3: T3);
   TConstProc<T1,T2,T3,T4> = reference to procedure (const Arg1: T1; const Arg2: T2; const Arg3: T3; const Arg4: T4);
+  TConstProc<T1,T2,T3,T4,T5> = reference to procedure (const Arg1: T1; const Arg2: T2; const Arg3: T3; const Arg4: T4; const Arg5: T5);
+  TConstProc<T1,T2,T3,T4,T5,T6> = reference to procedure (const Arg1: T1; const Arg2: T2; const Arg3: T3; const Arg4: T4; const Arg5: T5; const Arg6: T6);
+  TConstProc<T1,T2,T3,T4,T5,T6,T7> = reference to procedure (const Arg1: T1; const Arg2: T2; const Arg3: T3; const Arg4: T4; const Arg5: T5; const Arg6: T6; const Arg7: T7);
 
   TConstFunc<TResult> = reference to function: TResult;
   TConstFunc<T,TResult> = reference to function (const Arg1: T): TResult;
   TConstFunc<T1,T2,TResult> = reference to function (const Arg1: T1; const Arg2: T2): TResult;
   TConstFunc<T1,T2,T3,TResult> = reference to function (const Arg1: T1; const Arg2: T2; const Arg3: T3): TResult;
   TConstFunc<T1,T2,T3,T4,TResult> = reference to function (const Arg1: T1; const Arg2: T2; const Arg3: T3; const Arg4: T4): TResult;
+  TConstFunc<T1,T2,T3,T4,T5,TResult> = reference to function (const Arg1: T1; const Arg2: T2; const Arg3: T3; const Arg4: T4; const Arg5: T5): TResult;
+  TConstFunc<T1,T2,T3,T4,T5,T6,TResult> = reference to function (const Arg1: T1; const Arg2: T2; const Arg3: T3; const Arg4: T4; const Arg5: T5; const Arg6: T6): TResult;
+  TConstFunc<T1,T2,T3,T4,T5,T6,T7,TResult> = reference to function (const Arg1: T1; const Arg2: T2; const Arg3: T3; const Arg4: T4; const Arg5: T5; const Arg6: T6; const Arg7: T7): TResult;
 
   TUnicodeCategories = set of TUnicodeCategory;
 
@@ -150,8 +161,14 @@ type
       const AIndex: Integer = 0; const ACount: Integer = 0): Integer; static;
     class function ExistsInArray<T>(const AArray: array of T; const AItem: T): Boolean; static;
 
+    // 获取主机名
+    class function GetHostName: string; static;
+
     // 获取调用堆栈信息
     class function GetStackTrace: string; static;
+
+    // 调用匿名函数, 如果匿名函数返回True, 则结束调用, 否则休眠设定时间后继续重试直到超时
+    class function CallAutoRetry(const AFunc: TFunc<Boolean>; ATimeoutMs, AIntervalMs: Integer): Boolean; static;
 
     class property AppFile: string read FAppFile;
     class property AppPath: string read FAppPath;
@@ -647,6 +664,25 @@ begin
     Result := High(Cardinal) - AStartTick + AEndTick;
 end;
 
+class function TUtils.CallAutoRetry(const AFunc: TFunc<Boolean>; ATimeoutMs,
+  AIntervalMs: Integer): Boolean;
+var
+  LStopwatch: TStopwatch;
+begin
+  LStopwatch := TStopwatch.StartNew;
+  repeat
+    Result := AFunc();
+    if Result then Exit;
+
+    if (LStopwatch.ElapsedMilliseconds >= ATimeoutMs) then
+      Exit(False);
+
+    Sleep(AIntervalMs);
+  until (LStopwatch.ElapsedMilliseconds >= ATimeoutMs);
+
+  Result := False;
+end;
+
 class function TUtils.CompareStringIncludeNumber(const AStr1,
   AStr2: string; const AIgnoreCase: Boolean): Integer;
 var
@@ -1088,6 +1124,33 @@ begin
     Result := S.SubString(0, I + 1);
   end;
 end;
+
+class function TUtils.GetHostName: string;
+{$IF defined(MSWINDOWS)}
+var
+  LBuf: array[0..MAX_COMPUTERNAME_LENGTH] of Char;
+  LSize: DWORD;
+begin
+  LSize := MAX_COMPUTERNAME_LENGTH + 1;
+  if GetComputerNameW(@LBuf[0], LSize) then
+    SetString(Result, LBuf, LSize)
+  else
+    Result := '';
+end;
+{$ELSEIF defined(DELPHI)}
+var
+  LBuf: array[0..255] of AnsiChar;
+begin
+  if Posix.Unistd.gethostname(@LBuf[0], SizeOf(LBuf)) = 0 then
+    Result := string(AnsiString(LBuf))
+  else
+    Result := '';
+end;
+{$ELSE FPC}
+begin
+  Result := unix.GetHostName;
+end;
+{$ENDIF}
 
 { TEncodingHelper }
 

@@ -139,7 +139,7 @@ begin
   if (LClientSocket = INVALID_SOCKET) then
   begin
     {$IFDEF DEBUG}
-    _LogLastOsError('TIocpCrossSocket._NewAccept.WSASocket, %s', [AListen.DebugInfo]);
+    _LogLastOsError(Self.ClassName + '._NewAccept.WSASocket, %s', [AListen.DebugInfo]);
     {$ENDIF}
     Exit;
   end;
@@ -157,7 +157,7 @@ begin
     and (WSAGetLastError <> WSA_IO_PENDING) then
   begin
     {$IFDEF DEBUG}
-    _LogLastOsError('TIocpCrossSocket._NewAccept.AcceptEx, %s', [AListen.DebugInfo]);
+    _LogLastOsError(Self.ClassName + '._NewAccept.AcceptEx, %s', [AListen.DebugInfo]);
     {$ENDIF}
     TSocketAPI.CloseSocket(LClientSocket);
     _FreeIoData(LPerIoData);
@@ -182,7 +182,7 @@ begin
     and (WSAGetLastError <> WSA_IO_PENDING) then
   begin
     {$IFDEF DEBUG}
-    _LogLastOsError('TIocpCrossSocket._NewReadZero.WSARecv, %s', [AConnection.DebugInfo]);
+    _LogLastOsError(Self.ClassName + '._NewReadZero.WSARecv, %s', [AConnection.DebugInfo]);
     {$ENDIF}
     _FreeIoData(LPerIoData);
     Exit(False);
@@ -211,7 +211,7 @@ begin
     SO_UPDATE_ACCEPT_CONTEXT, LListenSocket) < 0) then
   begin
     {$IFDEF DEBUG}
-    _LogLastOsError('TIocpCrossSocket._HandleAccept.SetSockOpt');
+    _LogLastOsError(Self.ClassName + '._HandleAccept.SetSockOpt');
     {$ENDIF}
     TSocketAPI.CloseSocket(LClientSocket);
     Exit;
@@ -220,7 +220,7 @@ begin
   if (CreateIoCompletionPort(LClientSocket, FIocpHandle, ULONG_PTR(LClientSocket), 0) = 0) then
   begin
     {$IFDEF DEBUG}
-    _LogLastOsError('TIocpCrossSocket._HandleAccept.CreateIoCompletionPort');
+    _LogLastOsError(Self.ClassName + '._HandleAccept.CreateIoCompletionPort');
     {$ENDIF}
     TSocketAPI.CloseSocket(LClientSocket);
     Exit;
@@ -238,27 +238,18 @@ procedure TIocpCrossSocket._HandleConnect(const APerIoData: PPerIoData);
 var
   LClientSocket: TSocket;
   LConnection: ICrossConnection;
-
-  procedure _Failed1;
-  begin
-    {$IFDEF DEBUG}
-    _LogLastOsError('TIocpCrossSocket._HandleConnect');
-    {$ENDIF}
-
-    if Assigned(APerIoData.Callback) then
-      APerIoData.Callback(nil, False);
-
-    TSocketAPI.CloseSocket(LClientSocket);
-  end;
+  LSockErr: Integer;
 begin
   LClientSocket := APerIoData.Socket;
+  LConnection := APerIoData.CrossData as ICrossConnection;
 
-  if (TSocketAPI.GetError(LClientSocket) <> 0) then
+  LSockErr := TSocketAPI.GetError(LClientSocket);
+  if (LSockErr <> 0) then
   begin
-    {$IFDEF DEBUG}
-    _LogLastOsError('TIocpCrossSocket._HandleConnect.GetError');
-    {$ENDIF}
-    _Failed1;
+    if (LConnection <> nil) then
+      LConnection.LastNetError := LSockErr;
+    _LogLastOsError(Self.ClassName + '._HandleConnect.GetError');
+    LConnection.Close;
     Exit;
   end;
 
@@ -266,18 +257,13 @@ begin
   if (TSocketAPI.SetSockOpt<Integer>(LClientSocket, SOL_SOCKET,
     SO_UPDATE_CONNECT_CONTEXT, 1) < 0) then
   begin
-    {$IFDEF DEBUG}
-    _LogLastOsError('TIocpCrossSocket._HandleConnect.SetSockOpt');
-    {$ENDIF}
-    _Failed1;
+    if (LConnection <> nil) then
+      LConnection.LastNetError := WSAGetLastError;
+    _LogLastOsError(Self.ClassName + '._HandleConnect.SetSockOpt');
+    LConnection.Close;
     Exit;
   end;
 
-//  LConnection := CreateConnection(Self, LClientSocket, ctConnect, APerIoData.Callback);
-//  TriggerConnecting(LConnection);
-//  TriggerConnected(LConnection);
-
-  LConnection := APerIoData.CrossData as ICrossConnection;
   TriggerConnected(LConnection);
 
   if not _NewReadZero(LConnection) then
@@ -305,7 +291,7 @@ begin
     // 对方主动断开连接
     if (LRcvd = 0) then
     begin
-      _Log('Recv=0(Close), %s', [LConnection.DebugInfo]);
+      _Log(Self.ClassName + '.Recv=0(Close), %s', [LConnection.DebugInfo]);
       LConnection.Close;
       Exit;
     end;
@@ -323,13 +309,23 @@ begin
       // 接收出错
       else
       begin
-        _LogLastOsError('Recv<0, %s', [LConnection.DebugInfo]);
+        _LogLastOsError(Self.ClassName + '.Recv<0, %s', [LConnection.DebugInfo]);
         LConnection.Close;
         Exit;
       end;
     end;
 
+    {$IFDEF DEBUG}
+    _Log('[%s]thread%d, _HandleRead.TriggerReceived准备执行, LRcvd=%d', [
+      Self.ClassName, TThread.Current.ThreadID, LRcvd
+    ]);
+    {$ENDIF}
     TriggerReceived(LConnection, @FRecvBuf[0], LRcvd);
+    {$IFDEF DEBUG}
+    _Log('[%s]thread%d, _HandleRead.TriggerReceived执行完成, LRcvd=%d', [
+      Self.ClassName, TThread.Current.ThreadID, LRcvd
+    ]);
+    {$ENDIF}
 
     // 回调中可能关闭了连接, 需要检查状态
     if LConnection.IsClosed then Exit;
@@ -371,14 +367,22 @@ procedure TIocpCrossSocket.StopLoop;
     LSocket: TSocket;
     LPerIoData: PPerIoData;
     LConnection: ICrossConnection;
+    LMaxWait: Integer;
   begin
-    while (AtomicCmpExchange(FPerIoDataCount, 0, 0) > 0) do
+    LMaxWait := 3000;
+    while (AtomicCmpExchange(FPerIoDataCount, 0, 0) > 0) and (LMaxWait > 0) do
     begin
       GetQueuedCompletionStatus(FIocpHandle, LBytes, ULONG_PTR(LSocket), POverlapped(LPerIoData), 10);
 
-      if (LPerIoData = nil) then Continue;
+      if (LPerIoData = nil) then
+      begin
+        Dec(LMaxWait, 10);
+        Continue;
+      end;
 
       try
+        TSocketAPI.CloseSocket(LPerIoData.Socket);
+
         if Assigned(LPerIoData.Callback) then
         begin
           if (LPerIoData.CrossData <> nil)
@@ -391,9 +395,7 @@ procedure TIocpCrossSocket.StopLoop;
         end;
 
         if (LPerIoData.CrossData <> nil) then
-          LPerIoData.CrossData.Close
-        else
-          TSocketAPI.CloseSocket(LPerIoData.Socket);
+          LPerIoData.CrossData.Close;
       finally
         _FreeIoData(LPerIoData);
       end;
@@ -406,10 +408,24 @@ var
 begin
   if (FIoThreads = nil) then Exit;
 
+  {$IFDEF DEBUG}
+  _Log('[%s][StopLoop] 开始停止, 线程数=%d', [
+    Self.ClassName, Length(FIoThreads)]);
+  {$ENDIF}
   CloseAll;
 
+  {$IFDEF DEBUG}
+  _Log('[%s][StopLoop] 等待连接关闭, ListensCount=%d, ConnectionsCount=%d', [
+    Self.ClassName, ListensCount, ConnectionsCount
+  ]);
+  {$ENDIF}
   while (ListensCount > 0) or (ConnectionsCount > 0) do Sleep(1);
 
+  {$IFDEF DEBUG}
+  _Log('[%s][StopLoop] 发送 SHUTDOWN_FLAG 唤醒所有线程', [
+    Self.ClassName
+  ]);
+  {$ENDIF}
   for I := 0 to Length(FIoThreads) - 1 do
     PostQueuedCompletionStatus(FIocpHandle, 0, 0, POverlapped(SHUTDOWN_FLAG));
 
@@ -419,7 +435,16 @@ begin
     if (FIoThreads[I].ThreadID = LCurrentThreadID) then
       raise ECrossSocket.Create('不能在IO线程中执行StopLoop!');
 
+    {$IFDEF DEBUG}
+    _Log('[%s]thread%d[StopLoop] 等待线程 %d 退出', [
+      Self.ClassName, FIoThreads[I].ThreadID, I
+    ]);
+    {$ENDIF}
     FIoThreads[I].WaitFor;
+    {$IFDEF DEBUG}
+    _Log('[%s]thread%d[StopLoop] 线程 %d 已退出', [
+      Self.ClassName, FIoThreads[I].ThreadID, I]);
+    {$ENDIF}
     FreeAndNil(FIoThreads[I]);
   end;
   FIoThreads := nil;
@@ -467,18 +492,14 @@ var
     end;
     if (TSocketAPI.Bind(ASocket, @LSockAddr.Addr, LSockAddr.AddrLen) < 0) then
     begin
-      {$IFDEF DEBUG}
-      _LogLastOsError('TIocpCrossSocket._Connect.Bind');
-      {$ENDIF}
+      _LogLastOsError(Self.ClassName + '._Connect.Bind');
       _Failed2;
       Exit(False);
     end;
 
     if (CreateIoCompletionPort(ASocket, FIocpHandle, ULONG_PTR(ASocket), 0) = 0) then
     begin
-      {$IFDEF DEBUG}
-      _LogLastOsError('TIocpCrossSocket._Connect.CreateIoCompletionPort');
-      {$ENDIF}
+      _LogLastOsError(Self.ClassName + '._Connect.CreateIoCompletionPort');
       _Failed2;
       Exit(False);
     end;
@@ -494,12 +515,12 @@ var
     if not ConnectEx(ASocket, AAddr.ai_addr, AAddr.ai_addrlen, nil, 0, LBytes, PWSAOverlapped(LPerIoData)) and
       (WSAGetLastError <> WSA_IO_PENDING) then
     begin
-      {$IFDEF DEBUG}
-      _LogLastOsError('TIocpCrossSocket._Connect.ConnectEx');
-      {$ENDIF}
+      // 先保存 WSAGetLastError 再记录日志, 避免后续 API 调用改写 lastError
+      if (LConnection <> nil) then
+        LConnection.LastNetError := WSAGetLastError;
+      _LogLastOsError(Self.ClassName + '._Connect.ConnectEx');
       _FreeIoData(LPerIoData);
       LConnection.Close;
-      _Failed2;
       Exit(False);
     end;
 
@@ -514,9 +535,7 @@ begin
   LAddrInfo := TSocketAPI.GetAddrInfo(AHost, APort, LHints);
   if (LAddrInfo = nil) then
   begin
-    {$IFDEF DEBUG}
-    _LogLastOsError('TIocpCrossSocket.Connect.GetAddrInfo');
-    {$ENDIF}
+    _LogLastOsError(Self.ClassName + '.Connect.GetAddrInfo');
     _Failed1;
     Exit;
   end;
@@ -529,9 +548,7 @@ begin
         LAddrInfo.ai_protocol, nil, 0, WSA_FLAG_OVERLAPPED);
       if (LSocket = INVALID_SOCKET) then
       begin
-        {$IFDEF DEBUG}
-        _LogLastOsError('TIocpCrossSocket.Connect.WSASocket');
-        {$ENDIF}
+        _LogLastOsError(Self.ClassName + '.Connect.WSASocket');
         _Failed1;
         Exit;
       end;
@@ -551,9 +568,7 @@ begin
     TSocketAPI.FreeAddrInfo(P);
   end;
 
-  {$IFDEF DEBUG}
-  _LogLastOsError('TIocpCrossSocket.Connect.Unknown');
-  {$ENDIF}
+  _LogLastOsError(Self.ClassName + '.Connect.Unknown');
   _Failed1;
 end;
 
@@ -610,7 +625,7 @@ begin
   if (LAddrInfo = nil) then
   begin
     {$IFDEF DEBUG}
-    _LogLastOsError('TIocpCrossSocket.Listen.GetAddrInfo');
+    _LogLastOsError(Self.ClassName + '.Listen.GetAddrInfo');
     {$ENDIF}
     _Failed;
     Exit;
@@ -626,7 +641,7 @@ begin
       if (LListenSocket = INVALID_SOCKET) then
       begin
         {$IFDEF DEBUG}
-        _LogLastOsError('TIocpCrossSocket.Listen.WSASocket');
+        _LogLastOsError(Self.ClassName + '.Listen.WSASocket');
         {$ENDIF}
         _Failed;
         Exit;
@@ -641,7 +656,7 @@ begin
       if (TSocketAPI.Bind(LListenSocket, LAddrInfo.ai_addr, LAddrInfo.ai_addrlen) < 0) then
       begin
         {$IFDEF DEBUG}
-        _LogLastOsError('TIocpCrossSocket.Listen.Bind');
+        _LogLastOsError(Self.ClassName + '.Listen.Bind');
         {$ENDIF}
         _Failed;
         Exit;
@@ -650,7 +665,7 @@ begin
       if (TSocketAPI.Listen(LListenSocket) < 0) then
       begin
         {$IFDEF DEBUG}
-        _LogLastOsError('TIocpCrossSocket.Listen.Listen');
+        _LogLastOsError(Self.ClassName + '.Listen.Listen');
         {$ENDIF}
         _Failed;
         Exit;
@@ -662,7 +677,7 @@ begin
       if (CreateIoCompletionPort(LListenSocket, FIocpHandle, ULONG_PTR(LListenSocket), 0) = 0) then
       begin
         {$IFDEF DEBUG}
-        _LogLastOsError('TIocpCrossSocket.Listen.CreateIoCompletionPort');
+        _LogLastOsError(Self.ClassName + '.Listen.CreateIoCompletionPort');
         {$ENDIF}
         _Failed;
         Exit;
@@ -711,7 +726,7 @@ begin
     and (WSAGetLastError <> WSA_IO_PENDING) then
   begin
     {$IFDEF DEBUG}
-    _LogLastOsError('WSASend, %s', [AConnection.DebugInfo]);
+    _LogLastOsError(Self.ClassName + '.WSASend, %s', [AConnection.DebugInfo]);
     {$ENDIF}
 
     // 出错多半是 WSAENOBUFS, 也就是投递的 WSASend 过多, 来不及发送
@@ -729,89 +744,103 @@ begin
 end;
 
 function TIocpCrossSocket.ProcessIoEvent: Boolean;
+  procedure _ReleasePerIoData(const APerIoData: PPerIoData; const AShutdown: Boolean);
+  var
+    LConnection: ICrossConnection;
+  begin
+    try
+      if (APerIoData.CrossData <> nil) then
+      begin
+        // AcceptEx虽然成功, 但是Socket句柄耗尽了, 再次投递AcceptEx
+        if (APerIoData.Action = ioAccept) then
+        begin
+          // 照理说能执行到这里, 说明Socket分配失败了
+          // 但是为了以防万一, 这里还是判断一下并释放掉无效的Socket句柄
+          if (APerIoData.Socket <> 0) then
+            TSocketAPI.CloseSocket(APerIoData.Socket);
+
+          // 关闭监听后会触发该错误, 这种情况不应该继续投递
+          if not AShutdown then
+          begin
+            _Log('[%s]thread%d, _NewAccept', [Self.ClassName, TThread.Current.ThreadID]);
+            _NewAccept(APerIoData.CrossData as ICrossListen);
+          end;
+        end else
+        begin
+          {$IFDEF DEBUG}
+          _LogLastOsError(
+            Format(Self.ClassName + '.ProcessIoEvent.GetQueuedCompletionStatus.CrossDataNotNil(socket=%d, action=%d)',
+              [APerIoData.Socket, Ord(APerIoData.Action)])
+          );
+          {$ENDIF}
+          if Assigned(APerIoData.Callback) then
+          begin
+            if (APerIoData.CrossData is TIocpConnection) then
+              LConnection := APerIoData.CrossData as ICrossConnection
+            else
+              LConnection := nil;
+
+            APerIoData.Callback(LConnection, False);
+          end;
+
+          APerIoData.CrossData.Close;
+        end;
+      end else
+      begin
+        {$IFDEF DEBUG}
+        _LogLastOsError(
+          Format(Self.ClassName + '.ProcessIoEvent.GetQueuedCompletionStatus.CrossDataIsNil(socket=%d, action=%d)',
+            [APerIoData.Socket, Ord(APerIoData.Action)])
+        );
+        {$ENDIF}
+        if Assigned(APerIoData.Callback) then
+          APerIoData.Callback(nil, False);
+
+        if (APerIoData.Socket <> 0) then
+          TSocketAPI.CloseSocket(APerIoData.Socket);
+      end;
+    finally
+      _FreeIoData(APerIoData);
+    end;
+  end;
 var
   LBytes: Cardinal;
   LSocket: TSocket;
   LPerIoData: PPerIoData;
-  LConnection: ICrossConnection;
-  {$IFDEF DEBUG}
   LErrNo: Cardinal;
-  {$ENDIF}
+  LIocpClosed: Boolean;
 begin
   if not GetQueuedCompletionStatus(FIocpHandle, LBytes, ULONG_PTR(LSocket), POverlapped(LPerIoData), INFINITE) then
   begin
-    {$IFDEF DEBUG}
+    // ERROR_INVALID_HANDLE, 6, IOCP句柄被关闭
+    // ERROR_ABANDONED_WAIT_0, $02DF, IOCP句柄被关闭
+    // WSA_OPERATION_ABORTED, 995, 监听端口被关闭, 由于线程退出或应用程序请求，已中止 I/O 操作。
+    // WSAENOTSOCK, 10038, 在一个非套接字上尝试了一个操作。
+    // WSAESHUTDOWN, 10058, 套接字已关闭
+    // ERROR_NETNAME_DELETED, 64, 指定的网络名不再可用
+    // ERROR_CONNECTION_REFUSED, 1225, 远程计算机拒绝网络连接。
     LErrNo := GetLastError;
+
     // 完成端口被关闭时可能会触发 ERROR_INVALID_HANDLE 和 ERROR_ABANDONED_WAIT_0
-    if (LErrNo <> ERROR_INVALID_HANDLE)
-      and (LErrNo <> ERROR_ABANDONED_WAIT_0)
-    then
-      _LogLastOsError('TIocpCrossSocket.ProcessIoEvent.GetQueuedCompletionStatus');
+    // 监听端口被关闭时会触发 WSA_OPERATION_ABORTED
+    LIocpClosed := (LErrNo = ERROR_INVALID_HANDLE)
+      or (LErrNo = ERROR_ABANDONED_WAIT_0)
+      or (LErrNo = WSA_OPERATION_ABORTED);
+    {$IFDEF DEBUG}
+    _Log('[%s]thread%d, GetQueuedCompletionStatus:%d, %s', [
+      Self.ClassName, TThread.Current.ThreadID, LErrNo, SysErrorMessage(LErrNo)
+    ]);
     {$ENDIF}
 
     // 出错了, 并且完成数据也都是空的,
     // 这种情况即便重试, 应该也会继续出错, 最好立即终止IO线程
     if (LPerIoData = nil) then Exit(False);
 
-    try
-      // WSA_OPERATION_ABORTED, 995, 由于线程退出或应用程序请求，已中止 I/O 操作。
-      // WSAENOTSOCK, 10038, 在一个非套接字上尝试了一个操作。
-      // WSAESHUTDOWN, 10058, 套接字已关闭
-      // ERROR_NETNAME_DELETED, 64, 指定的网络名不再可用
-      // ERROR_CONNECTION_REFUSED, 1225, 远程计算机拒绝网络连接。
-      if (LPerIoData.CrossData <> nil) then
-      begin
-        // AcceptEx虽然成功, 但是Socket句柄耗尽了, 再次投递AcceptEx
-        if (LPerIoData.Action = ioAccept) then
-        begin
-          // 照理说能执行到这里, 说明Socket分配失败了
-          // 但是为了以防万一, 这里还是判断一下并释放掉无效的Socket句柄
-          if (LPerIoData.Socket <> 0) then
-            TSocketAPI.CloseSocket(LPerIoData.Socket);
-
-          // 关闭监听后会触发该错误, 这种情况不应该继续投递
-          if (GetLastError <> WSA_OPERATION_ABORTED) then
-            _NewAccept(LPerIoData.CrossData as ICrossListen);
-        end else
-        begin
-          {$IFDEF DEBUG}
-          _LogLastOsError(
-            Format('TIocpCrossSocket.ProcessIoEvent.GetQueuedCompletionStatus.CrossDataNotNil(socket=%d, action=%d)',
-              [LPerIoData.Socket, Ord(LPerIoData.Action)])
-          );
-          {$ENDIF}
-          if Assigned(LPerIoData.Callback) then
-          begin
-            if (LPerIoData.CrossData is TIocpConnection) then
-              LConnection := LPerIoData.CrossData as ICrossConnection
-            else
-              LConnection := nil;
-
-            LPerIoData.Callback(LConnection, False);
-          end;
-
-          LPerIoData.CrossData.Close;
-        end;
-      end else
-      begin
-        {$IFDEF DEBUG}
-        _LogLastOsError(
-          Format('TIocpCrossSocket.ProcessIoEvent.GetQueuedCompletionStatus.CrossDataIsNil(socket=%d, action=%d)',
-            [LPerIoData.Socket, Ord(LPerIoData.Action)])
-        );
-        {$ENDIF}
-        if Assigned(LPerIoData.Callback) then
-          LPerIoData.Callback(nil, False);
-
-        if (LPerIoData.Socket <> 0) then
-          TSocketAPI.CloseSocket(LPerIoData.Socket);
-      end;
-    finally
-      _FreeIoData(LPerIoData);
-    end;
+    // 出错了, 回收资源
+    _ReleasePerIoData(LPerIoData, LIocpClosed);
 
     // 出错了, 但是完成数据不是空的, 需要重试
-    Exit(True);
+    Exit(not LIocpClosed);
   end;
 
   // 主动调用了 StopLoop
@@ -822,12 +851,22 @@ begin
   if (LPerIoData = nil) then Exit(True);
 
   try
+    {$IFDEF DEBUG}
+    _Log('[%s]thread%d, 准备处理IOCP事件 PerIoData=%p, Action=%d, Bytes=%d', [
+      Self.ClassName, TThread.Current.ThreadID, Pointer(LPerIoData), Ord(LPerIoData.Action), LBytes
+    ]);
+    {$ENDIF}
     case LPerIoData.Action of
       ioAccept  : _HandleAccept(LPerIoData);
       ioConnect : _HandleConnect(LPerIoData);
       ioRead    : _HandleRead(LPerIoData);
       ioWrite   : _HandleWrite(LPerIoData);
     end;
+    {$IFDEF DEBUG}
+    _Log('[%s]thread%d, 处理IOCP事件完成 PerIoData=%p, Action=%d, Bytes=%d', [
+      Self.ClassName, TThread.Current.ThreadID, Pointer(LPerIoData), Ord(LPerIoData.Action), LBytes
+    ]);
+    {$ENDIF}
   finally
     _FreeIoData(LPerIoData);
   end;

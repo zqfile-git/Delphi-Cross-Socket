@@ -1799,7 +1799,7 @@ begin
   if ASource.FValueOwned then
   begin
     if (FFilePath <> '') then
-      FValue := TFileUtils.OpenRead(FFilePath)
+      FValue := TFileUtils.OpenRead(FFilePath, fmShareDenyNone)
     else
     begin
       FValue := TBytesStream.Create;
@@ -1918,7 +1918,7 @@ function THttpMultiPartFormData.AddFile(const AFieldName, AFileName: string): TF
 begin
   Result := AddFile(AFieldName,
     ExtractFileName(AFileName),
-    TFileUtils.OpenRead(AFileName),
+    TFileUtils.OpenRead(AFileName, fmShareDenyNone),
     True);
   Result.FFilePath := AFileName;
 end;

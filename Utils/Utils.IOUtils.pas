@@ -1426,12 +1426,79 @@ begin
 end;
 
 class function TPathUtils.GetFullPath(const APath: string): string;
+var
+  LPath, LBasePath: string;
+  LParts: TArray<string>;
+  LStack: TArray<string>;
+  I, LStackLen: Integer;
+  LPart: string;
+  {$IFDEF MSWINDOWS}
+  LDrivePrefix: string;
+  {$ENDIF}
 begin
-  if IsRelativePath(APath) then
-    // 相对路径的文件名用程序所在路径补全
-    Result := Combine(TUtils.AppPath, APath)
+  {$IFDEF MSWINDOWS}
+  LPath := APath.Replace('/', '\');
+  {$ELSE}
+  LPath := APath;
+  {$ENDIF}
+
+  // 如果是相对路径，先与程序路径组合
+  if IsRelativePath(LPath) then
+    LBasePath := Combine(TUtils.AppPath, LPath)
   else
-    Result := APath;
+    LBasePath := LPath;
+  
+  {$IFDEF MSWINDOWS}
+  // Windows 下先提取盘符
+  if IsDriveRooted(LBasePath) then
+  begin
+    LDrivePrefix := Copy(LBasePath, 1, 2);
+    LBasePath := Copy(LBasePath, 3, MaxInt); // 移除盘符部分
+  end else
+    LDrivePrefix := '';
+  {$ENDIF}
+  
+  // 规范化路径，解析 .. 和 .
+  LParts := LBasePath.Split([PathDelim], TStringSplitOptions.ExcludeEmpty);
+  SetLength(LStack, Length(LParts));
+  LStackLen := 0;
+  
+  for I := 0 to High(LParts) do
+  begin
+    LPart := LParts[I];
+    
+    // 跳过当前目录符号
+    if (LPart = '.') then
+      Continue;
+    
+    // 处理上级目录符号
+    if (LPart = '..') then
+    begin
+      // 如果栈不为空，弹出一个目录
+      if (LStackLen > 0) then
+        Dec(LStackLen);
+    end else
+    begin
+      // 普通目录名，压入栈
+      LStack[LStackLen] := LPart;
+      Inc(LStackLen);
+    end;
+  end;
+  
+  // 重新组合路径
+  if (LStackLen = 0) then
+    Result := PathDelim
+  else
+  begin
+    SetLength(LStack, LStackLen);
+    Result := PathDelim + string.Join(PathDelim, LStack);
+  end;
+  
+  {$IFDEF MSWINDOWS}
+  // Windows 下添加盘符
+  if (LDrivePrefix <> '') then
+    Result := LDrivePrefix + Result;
+  {$ENDIF}
 end;
 
 class function TPathUtils.GetHomePath: string;
@@ -1442,7 +1509,7 @@ end;
 class function TPathUtils.IsDriveRooted(const APath: string): Boolean;
 begin
   {$IFDEF MSWINDOWS}
-  Result:=(Length(aPath) > 1)
+  Result:=(Length(APath) > 1)
     and CharInSet(APath[1], ['a'..'z', 'A'..'Z'])
     and (APath[2] = ':');
   {$ELSE}
@@ -1452,9 +1519,18 @@ end;
 
 class function TPathUtils.IsRelativePath(const APath: string): Boolean;
 begin
-  Result:= not APath.StartsWith(PathDelim)
-    and not IsDriveRooted(aPath)
-    and not IsUNCRooted(aPath);
+  // 空路径视为相对路径（当前目录）
+  if (APath = '') then
+    Exit(True);
+  
+  // 绝对路径的判断条件：
+  // 1. Windows: 盘符开头 (C:\) 或 UNC路径 (\\server\)
+  // 2. Linux/Unix: 以 / 开头
+  {$IFDEF MSWINDOWS}
+  Result := not IsDriveRooted(APath) and not IsUNCRooted(APath);
+  {$ELSE}
+  Result := not APath.StartsWith(PathDelim);
+  {$ENDIF}
 end;
 
 class function TPathUtils.IsUNCRooted(const APath: string): Boolean;

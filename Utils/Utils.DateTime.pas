@@ -162,6 +162,7 @@ type
     function WithinSeconds(const ADateTime: TDateTime; const ASeconds: Int64): Boolean; inline;
     function WithinMilliseconds(const ADateTime: TDateTime; const AMilliseconds: Int64): Boolean; inline;
 
+    function ToDosDateTime: UInt32;
     function ToUniversalTime(const AForceDaylight: Boolean = False): TDateTime; inline;
     function ToLocalTime: TDateTime; inline;
     function ToTimeStamp: TTimeStamp; inline;
@@ -545,6 +546,24 @@ begin
   Result := StartOfTheYear(Self);
 end;
 
+function TDateTimeHelper.ToDosDateTime: UInt32;
+var
+  Year, Month, Day, Hour, Min, Sec, MSec: Word;
+begin
+  DecodeDate(Self, Year, Month, Day);
+  DecodeTime(Self, Hour, Min, Sec, MSec);
+
+  // MS-DOS 格式只支持 1980-2107 年
+  if Year < 1980 then
+    Year := 1980
+  else if Year > 2107 then
+    Year := 2107;
+
+  // 组装 MS-DOS 日期时间格式
+  Result := (Sec shr 1) or (Min shl 5) or (Hour shl 11) or
+            (Day shl 16) or (Month shl 21) or ((Year - 1980) shl 25);
+end;
+
 function TDateTimeHelper.ToISO8601(const AIsUtcDateTime: Boolean): string;
 const
   NEG: array [Boolean] of string = ('-', '+');
@@ -683,6 +702,7 @@ begin
 
   P := PChar(AStr);
   PEnd := P + Length(AStr);
+  // /Date(1759808129000)/
   if (P^ = '/') and (StrLComp('Date(', P + 1, 5) = 0) then  // .NET: milliseconds since 1970-01-01
   begin
     Inc(P, 6);
@@ -700,7 +720,7 @@ begin
     end;
     if (P + 2 = PEnd) and (P[0] = ')') and (P[1] = '/') then
       //ADateTime := TDateTime(UnixDateDelta + (LMSecsSince1970 / MSecsPerDay))
-    	 // fpc 在开启 delphi 模式, 并且目标设置为 32位的情况,
+      // fpc 在开启 delphi 模式, 并且目标设置为 32位的情况,
       // 将 Extended 类型强制转换为 TDateTime 会编译报错,
       // 直接赋值倒是能编译通过
       ADateTime := UnixDateDelta + (LMSecsSince1970 / MSecsPerDay)
@@ -749,7 +769,7 @@ begin
         if (P^ = '+') or (P^ = '-') then
         begin
           if (P^ = '+') then
-            LSign := -1 //  +0100 means that the time is 1 hour later than UTC
+            LSign := -1 //  +01:00 means that the time is 1 hour later than UTC
           else
             LSign := 1;
 

@@ -23,7 +23,12 @@ uses
   SysUtils,
   Math,
   Generics.Collections,
+  //ZLib,
+  {$IFDEF DELPHI}
   ZLib,
+  {$ELSE}
+  DTF.StaticZLib,
+  {$ENDIF}
 
   Net.SocketAPI,
   Net.CrossSocket.Base,
@@ -1629,14 +1634,14 @@ type
     FRequest: ICrossHttpRequest;
     FResponseObj: TCrossHttpResponse;
     FResponse: ICrossHttpResponse;
-    FHttpParser: TCrossHttpParser;
+    FHttpParser: ICrossHttpParser;
     FPending: Integer;
 
     {$region 'HttpParser事件'}
     // 以下事件都在 FHttpParser.Decode 中被触发
     // 而 FHttpParser.Decode 在 ParseRecvData 中被调用
     // ParseRecvData 在 FServer.LogicReceived 中被调用
-    // FServer.LogicReceived 被 TCrossConnectionBase._Lock 保护
+    // FServer.LogicReceived 被 TCrossConnectionBase._LockRecv 保护
     // 所以无需担心以下事件的多线程安全问题
     procedure _OnHeaderData(const ADataPtr: Pointer; const ADataSize: Integer);
     function _OnGetHeaderValue(const AHeaderName: string; out AHeaderValue: string): Boolean;
@@ -2232,7 +2237,10 @@ begin
   if (FResponse <> nil) then
     (FResponse as TCrossHttpResponse).FConnection := nil;
 
-  FreeAndNil(FHttpParser);
+  ReleaseRequest;
+  ReleaseResponse;
+
+  FHttpParser := nil;
 
   inherited;
 end;
@@ -2255,7 +2263,10 @@ end;
 procedure TCrossHttpConnection.ParseRecvData(var ABuf: Pointer;
   var ALen: Integer);
 begin
-  FHttpParser.Decode(ABuf, ALen);
+  if (FHttpParser <> nil) then
+    FHttpParser.Decode(ABuf, ALen)
+  else
+    ALen := 0;
 end;
 
 procedure TCrossHttpConnection.ReleaseRequest;
@@ -2404,7 +2415,10 @@ end;
 procedure TCrossHttpConnection._OnParseFailed(const ACode: Integer;
   const AError: string);
 begin
-  FResponse.SendStatus(ACode, AError);
+  if (FResponse <> nil) then
+    FResponse.SendStatus(ACode, AError)
+  else
+    Close;
 end;
 
 procedure TCrossHttpConnection._OnParseSuccess;
@@ -3375,10 +3389,13 @@ begin
     begin
       if Assigned(FOnRequestException) then
         FOnRequestException(Self, LRequest, LResponse, e)
-      else if (e is ECrossHttpException) then
-        LResponse.SendStatus(ECrossHttpException(e).StatusCode, ECrossHttpException(e).Message)
-      else
-        LResponse.SendStatus(500, e.Message);
+      else if not LResponse.Sent then
+      begin
+        if (e is ECrossHttpException) then
+          LResponse.SendStatus(ECrossHttpException(e).StatusCode, ECrossHttpException(e).Message)
+        else
+          LResponse.SendStatus(500, e.Message);
+      end;
     end;
   end;
 end;
@@ -4600,7 +4617,13 @@ begin
       AConnection.SendBuf(LData^, LCount, LSender);
     end;
 
-  LSender(LHttpConnection, True);
+  try
+    LSender(LHttpConnection, True);
+  except
+    LHttpConnection := nil;
+    LSender := nil;
+    raise;
+  end;
 end;
 
 procedure TCrossHttpResponse._Send(const AHeaderSource,

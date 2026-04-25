@@ -27,22 +27,22 @@ type
   ERegEx = class(Exception);
   IRegEx = interface;
 
-  // roNotEmpty 只用于 Split
-  TRegExOption = (roIgnoreCase, roMultiLine, roSingleLine, roExtended, roNotEmpty);
+  // roNotEmpty,roKeepSpliter 只用于 Split
+  TRegExOption = (roIgnoreCase, roMultiLine, roSingleLine, roExtended, roNotEmpty, roKeepSpliter);
   TRegExOptions = set of TRegExOption;
 
   TGroup = record
   private
-    FIndex: Integer;
+    FOffset: Integer;
     FLength: Integer;
     FSuccess: Boolean;
     FValue: string;
 
     function GetValue: string;
   public
-	  constructor Create(const AValue: string; const AIndex, ALength: Integer; const ASuccess: Boolean);
+	  constructor Create(const AValue: string; const AOffset, ALength: Integer; const ASuccess: Boolean);
 
-    property Index: Integer read FIndex;
+    property Offset: Integer read FOffset;
     property Length: Integer read FLength;
     property Success: Boolean read FSuccess;
     property Value: string read GetValue;
@@ -59,7 +59,7 @@ type
     function GetItem(const AIndex: Variant): TGroup;
   public
     constructor Create(const ARegEx: IRegEx; const AValue: string;
-      const AIndex, ALength: Integer; const ASuccess: Boolean);
+      const AOffset, ALength: Integer; const ASuccess: Boolean);
 
   	function GetEnumerator: TGroupCollectionEnumerator;
     property Count: Integer read GetCount;
@@ -84,18 +84,18 @@ type
     FGroups: TGroupCollection;
     FRegEx: IRegEx;
 
-    function GetIndex: Integer;
+    function GetOffset: Integer;
     function GetGroups: TGroupCollection;
     function GetLength: Integer;
     function GetSuccess: Boolean;
     function GetValue: string;
   public
     constructor Create(const ARegEx: IRegEx; const AValue: string;
-	    const AIndex, ALength: Integer; const ASuccess: Boolean);
+	    const AOffset, ALength: Integer; const ASuccess: Boolean);
 
     function NextMatch: TMatch;
     property Groups: TGroupCollection read GetGroups;
-    property Index: Integer read GetIndex;
+    property Offset: Integer read GetOffset;
     property Length: Integer read GetLength;
     property Success: Boolean read GetSuccess;
     property Value: string read GetValue;
@@ -285,24 +285,24 @@ implementation
 
 { TGroup }
 
-constructor TGroup.Create(const AValue: string; const AIndex, ALength: Integer;
+constructor TGroup.Create(const AValue: string; const AOffset, ALength: Integer;
   const ASuccess: Boolean);
 begin
   FSuccess := ASuccess;
   FValue := AValue;
-  FIndex := AIndex;
+  FOffset := AOffset;
   FLength := ALength;
 end;
 
 function TGroup.GetValue: string;
 begin
-  Result := FValue.Substring(FIndex - 1, FLength);
+  Result := FValue.Substring(FOffset - 1, FLength);
 end;
 
 { TGroupCollection }
 
 constructor TGroupCollection.Create(const ARegEx: IRegEx; const AValue: string;
-  const AIndex, ALength: Integer; const ASuccess: Boolean);
+  const AOffset, ALength: Integer; const ASuccess: Boolean);
 var
   I: Integer;
 begin
@@ -311,7 +311,7 @@ begin
   if ASuccess then
   begin
     SetLength(FList, FRegEx.GroupCount + 1);
-    FList[0] := TGroup.Create(AValue, AIndex, ALength, ASuccess);
+    FList[0] := TGroup.Create(AValue, AOffset, ALength, ASuccess);
     for I := 1 to Length(FList) - 1 do
       FList[I] := TGroup.Create(AValue, FRegEx.GroupOffsets[I], FRegEx.GroupLengths[I], ASuccess);
   end;
@@ -371,10 +371,10 @@ end;
 { TMatch }
 
 constructor TMatch.Create(const ARegEx: IRegEx; const AValue: string;
-  const AIndex, ALength: Integer; const ASuccess: Boolean);
+  const AOffset, ALength: Integer; const ASuccess: Boolean);
 begin
-  FGroup := TGroup.Create(AValue, AIndex, ALength, ASuccess);
-  FGroups := TGroupCollection.Create(ARegEx, AValue, AIndex, ALength, ASuccess);
+  FGroup := TGroup.Create(AValue, AOffset, ALength, ASuccess);
+  FGroups := TGroupCollection.Create(ARegEx, AValue, AOffset, ALength, ASuccess);
   FRegEx := ARegEx;
 end;
 
@@ -383,9 +383,9 @@ begin
   Result := FGroups;
 end;
 
-function TMatch.GetIndex: Integer;
+function TMatch.GetOffset: Integer;
 begin
-  Result := FGroup.Index;
+  Result := FGroup.Offset;
 end;
 
 function TMatch.GetLength: Integer;
@@ -901,10 +901,11 @@ function TRegEx.Split(const ACount: Integer): TArray<string>;
 var
   LPrevPos: Integer;
   I: Integer;
-  LSplitedStr: string;
+  LPreSpliter, LSplitedStr: string;
 begin
   Result := [];
   LPrevPos := 1;
+  LPreSpliter := '';
 
   if Match then
   begin
@@ -917,13 +918,17 @@ begin
         LPrevPos,
         Self.MatchedOffset - LPrevPos);
 
-      LPrevPos := Self.MatchedOffset + Self.MatchedLength;
+      if (roKeepSpliter in FOptions) then
+        LSplitedStr := LPreSpliter + LSplitedStr;
 
       if (LSplitedStr <> '') or not (roNotEmpty in FOptions) then
       begin
         Result := Result + [LSplitedStr];
         Inc(I);
       end;
+
+      LPrevPos := Self.MatchedOffset + Self.MatchedLength;
+      LPreSpliter := Self.MatchedText;
 
       if ((ACount > 0) and (I >= ACount))
         or (not MatchAgain) then
@@ -932,6 +937,8 @@ begin
   end;
 
   LSplitedStr := System.Copy(Self.Subject, LPrevPos, MaxInt);
+  if (roKeepSpliter in FOptions) then
+    LSplitedStr := LPreSpliter + LSplitedStr;
   if (LSplitedStr <> '') or not (roNotEmpty in FOptions) then
     Result := Result + [LSplitedStr];
 end;
