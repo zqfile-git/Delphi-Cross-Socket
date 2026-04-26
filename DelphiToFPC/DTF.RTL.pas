@@ -38,7 +38,9 @@ implementation
 
 function GetLastError: Integer;
 begin
-  {$IFDEF MSWINDOWS}
+  {$IF defined(DELPHI)}
+  Result := GetLastError;
+  {$ELSEIF defined(MSWINDOWS)}
   Result := Windows.GetLastError;
   {$ELSE}
   Result := fpgeterrno;
