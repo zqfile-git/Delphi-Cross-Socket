@@ -1675,15 +1675,20 @@ begin
       Inc(P);
     end;
 
-    // 退出内层: 要么 P 指向 CR (CRLF 完整), 要么 P >= PEnd (末尾不完整)
-    if (P >= PEnd) then Break; // 末尾残片整段丢弃
-
-    Inc(P, 2); // 跳过 CRLF
+    // 退出内层: P 指向 CR (CRLF 完整) 或 P >= PEnd (末尾无 CRLF).
+    // 末尾无 CRLF 的残行也按相同规则尝试入库, 兼容 multipart part header
+    // 等调用方剥掉块终止符 \r\n\r\n 后再喂入的字符串. 主路径 HTTP
+    // request/response header 末尾必带空行 \r\n, 始终走 CRLF 完整分支,
+    // 严格性不变.
+    if (P < PEnd) then
+      Inc(P, 2); // 跳过 CRLF; PEnd 路径 P 已等于 PEnd, 外层 while 自然退出
 
     if not LLineValid then Continue;
 
-    // 空行: header 块结束标记, 跳过 (LLineStart 等于 CRLF 位置, 即 P-2)
-    if (LLineStart = P - 2) then Continue;
+    // 空行: header 块结束标记, 跳过.
+    //   CRLF 完整路径: LLineStart 指向被消费 CRLF 的位置 (即 P - 2)
+    //   PEnd 路径    : LLineStart 等于 P (本行 0 字节)
+    if (LLineStart = P) or (LLineStart = P - 2) then Continue;
 
     // 必须出现过 ':'
     if (LColonPos = nil) then Continue;
