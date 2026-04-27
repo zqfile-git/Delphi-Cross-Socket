@@ -31,12 +31,31 @@ uses
 
   Utils.StrUtils;
 
+const
+  // 默认压缩比上限 (DecodedSize / EncodedSize)
+  // 合法数据典型 1.5-15:1, 极端规整数据 (StringOfChar, 大块重复字节) 可达 100-500:1
+  // 经典 zip bomb (42.zip) 约 100000:1, 极简 bomb 约 1000:1
+  // 默认 1000:1 兜底拦截 zip bomb, 不影响合法极规整数据
+  DEFAULT_MAX_COMPRESS_RATIO = 1000;
+
 type
   TCrossHttpParseMode = (pmServer, pmClient);
   TCrossHttpParseState = (psIdle, psHeader, psBodyData, psChunkSize, psChunkData, psChunkEnd, psDone);
 
+  /// <summary>
+  ///   psHeader 阶段严格 CRLF 状态机 (RFC 7230 §3): 拒绝 bare-CR / bare-LF / 错乱
+  ///   序列, 防御 HTTP 请求走私 (request smuggling).
+  /// </summary>
+  TCrossHttpHeaderCRLFState = (
+    hcsLineBody,      // 行内字节, 期望普通字节或 \r
+    hcsAfterCR,       // 已读 \r, 期望 \n
+    hcsAfterCRLF,     // 已读 \r\n (空行起始), 期望普通字节、\r 或 EOF
+    hcsAfterCRLFCR,   // 已读 \r\n\r, 期望 \n 完成 header
+    hcsHeaderDone     // 已读完整 \r\n\r\n, header 结束
+  );
+
   TOnHeaderData = procedure(const ADataPtr: Pointer; const ADataSize: Integer) of object;
-  TOnGetHeaderValue = function(const AHeaderName: string; out AHeaderValue: string): Boolean of object;
+  TOnGetHeaderValue = function(const AHeaderName: string; out AHeaderValues: TArray<string>): Boolean of object;
   TOnBodyBegin = procedure of object;
   TOnBodyData = procedure(const ADataPtr: Pointer; const ADataSize: Integer) of object;
   TOnBodyEnd = procedure of object;
@@ -54,6 +73,8 @@ type
     procedure SetMaxHeaderSize(const AValue: Integer);
     function GetMaxBodyDataSize: Integer;
     procedure SetMaxBodyDataSize(const AValue: Integer);
+    function GetMaxCompressRatio: Integer;
+    procedure SetMaxCompressRatio(const AValue: Integer);
 
     function GetOnHeaderData: TOnHeaderData;
     procedure SetOnHeaderData(const AValue: TOnHeaderData);
@@ -74,6 +95,7 @@ type
 
     property MaxHeaderSize: Integer read GetMaxHeaderSize write SetMaxHeaderSize;
     property MaxBodyDataSize: Integer read GetMaxBodyDataSize write SetMaxBodyDataSize;
+    property MaxCompressRatio: Integer read GetMaxCompressRatio write SetMaxCompressRatio;
 
     property OnHeaderData: TOnHeaderData read GetOnHeaderData write SetOnHeaderData;
     property OnGetHeaderValue: TOnGetHeaderValue read GetOnGetHeaderValue write SetOnGetHeaderValue;
@@ -88,7 +110,7 @@ type
   TCrossHttpParser = class(TInterfacedObject, ICrossHttpParser)
   private
     FMode: TCrossHttpParseMode;
-    FMaxHeaderSize, FMaxBodyDataSize: Integer;
+    FMaxHeaderSize, FMaxBodyDataSize, FMaxCompressRatio: Integer;
     FOnHeaderData: TOnHeaderData;
     FOnGetHeaderValue: TOnGetHeaderValue;
     FOnBodyBegin: TOnBodyBegin;
@@ -102,9 +124,11 @@ type
     FTransferEncoding, FContentEncoding, FConnectionStr: string;
     FIsChunked: Boolean;
 
-    FParsedBodySize: Int64;
+    FParsedBodySize, FDecodedBodySize: Int64;
     FParseState: TCrossHttpParseState;
     FCRCount, FLFCount: Integer;
+    // psHeader 严格 CRLF 状态机 (含义详见 TCrossHttpHeaderCRLFState).
+    FHeaderCRLFState: TCrossHttpHeaderCRLFState;
     FHeaderStream, FChunkSizeStream: TMemoryStream;
     FChunkSize, FChunkLeftSize: Integer;
     FHasBody, FNoBody: Boolean;
@@ -118,6 +142,7 @@ type
     FZBuffer: TBytes;
 
     procedure _OnHeaderData(const ADataPtr: Pointer; const ADataSize: Integer);
+    function _OnGetHeaderValues(const AHeaderName: string; out AHeaderValues: TArray<string>): Boolean;
     function _OnGetHeaderValue(const AHeaderName: string; out AHeaderValue: string): Boolean;
     procedure _OnBodyBegin;
     procedure _OnBodyData(const ADataPtr: Pointer; const ADataSize: Integer);
@@ -132,6 +157,8 @@ type
     procedure SetMaxHeaderSize(const AValue: Integer);
     function GetMaxBodyDataSize: Integer;
     procedure SetMaxBodyDataSize(const AValue: Integer);
+    function GetMaxCompressRatio: Integer;
+    procedure SetMaxCompressRatio(const AValue: Integer);
 
     function GetOnHeaderData: TOnHeaderData;
     procedure SetOnHeaderData(const AValue: TOnHeaderData);
@@ -159,6 +186,7 @@ type
 
     property MaxHeaderSize: Integer read GetMaxHeaderSize write SetMaxHeaderSize;
     property MaxBodyDataSize: Integer read GetMaxBodyDataSize write SetMaxBodyDataSize;
+    property MaxCompressRatio: Integer read GetMaxCompressRatio write SetMaxCompressRatio;
 
     property OnHeaderData: TOnHeaderData read GetOnHeaderData write SetOnHeaderData;
     property OnGetHeaderValue: TOnGetHeaderValue read GetOnGetHeaderValue write SetOnGetHeaderValue;
@@ -172,11 +200,117 @@ type
 
 implementation
 
+const
+  MAX_CHUNK_SIZE_LINE = 64;
+  // 解压初期累计输出小于此阈值时不检查 ratio, 避免短数据造成的误报
+  MIN_DECOMPRESS_CHECK_BYTES = 1024;
+
+function _TryParseContentLengthValue(const AValue: string;
+  out AContentLength: Int64): Boolean;
+var
+  I, LDigit: Integer;
+  LValueStr: string;
+  LValue: Int64;
+  LChar: Char;
+begin
+  AContentLength := -1;
+
+  LValueStr := AValue.Trim;
+  if (LValueStr = '') then Exit(False);
+
+  LValue := 0;
+  for I := 1 to Length(LValueStr) do
+  begin
+    LChar := LValueStr[I];
+    case LChar of
+      '0'..'9': LDigit := Ord(LChar) - Ord('0');
+    else
+      Exit(False);
+    end;
+
+    if (LValue > (High(Int64) - LDigit) div 10) then Exit(False);
+    LValue := LValue * 10 + LDigit;
+  end;
+
+  AContentLength := LValue;
+  Result := True;
+end;
+
+function _TryParseTransferEncodingValue(const AValue: string;
+  out ATransferEncoding: string; out AIsChunked: Boolean): Boolean;
+var
+  LStart, LPos, LLen, LTokenCount: Integer;
+  LToken: string;
+begin
+  ATransferEncoding := '';
+  AIsChunked := False;
+  LTokenCount := 0;
+
+  LLen := Length(AValue);
+  LStart := 1;
+  while (LStart <= LLen + 1) do
+  begin
+    LPos := LStart;
+    while (LPos <= LLen) and (AValue[LPos] <> ',') do
+      Inc(LPos);
+
+    LToken := Trim(Copy(AValue, LStart, LPos - LStart));
+    if not TStrUtils.SameText(LToken, 'chunked') then Exit(False);
+
+    Inc(LTokenCount);
+
+    if (LPos > LLen) then Break;
+    LStart := LPos + 1;
+  end;
+
+  if (LTokenCount <> 1) then Exit(False);
+
+  ATransferEncoding := 'chunked';
+  AIsChunked := True;
+  Result := True;
+end;
+
+function _TryParseChunkSizeLine(const ALine: string; out AChunkSize: Integer): Boolean;
+var
+  I, LExtIndex, LDigit: Integer;
+  LLine: string;
+  LValue: Int64;
+  LChar: Char;
+begin
+  AChunkSize := 0;
+  LLine := ALine.Trim;
+  LExtIndex := LLine.IndexOf(';');
+  if (LExtIndex >= 0) then
+    LLine := LLine.Substring(0, LExtIndex).Trim;
+
+  if (LLine = '') then Exit(False);
+
+  LValue := 0;
+  for I := 1 to Length(LLine) do
+  begin
+    LChar := LLine[I];
+    case LChar of
+      '0'..'9': LDigit := Ord(LChar) - Ord('0');
+      'a'..'f': LDigit := Ord(LChar) - Ord('a') + 10;
+      'A'..'F': LDigit := Ord(LChar) - Ord('A') + 10;
+    else
+      Exit(False);
+    end;
+
+    if (LValue > (High(Integer) - LDigit) div 16) then Exit(False);
+    LValue := LValue * 16 + LDigit;
+  end;
+
+  AChunkSize := LValue;
+  Result := True;
+end;
+
 { TCrossHttpParser }
 
 constructor TCrossHttpParser.Create(const AMode: TCrossHttpParseMode);
 begin
   FMode := AMode;
+  FMaxCompressRatio := DEFAULT_MAX_COMPRESS_RATIO;
   FHeaderStream := TMemoryStream.Create;
   FParseState := psIdle;
 end;
@@ -186,6 +320,7 @@ begin
   Finish;
 
   FreeAndNil(FHeaderStream);
+  FreeAndNil(FChunkSizeStream);
 
   inherited;
 end;
@@ -194,7 +329,9 @@ procedure TCrossHttpParser.Decode(var ABuf: Pointer; var ALen: Integer);
 var
   LPtr, LPtrEnd{$IFDEF __MERGE_HEADER_WRITE__}, LPtrHeader{$ENDIF}: PByte;
   LChunkSize: Integer;
-  LLineStr, LContentLength: string;
+  LLineStr, LContentLength, LTransferEncoding: string;
+  LContentLengthValues, LTransferEncodingValues: TArray<string>;
+  LHasContentLength, LHasTransferEncoding: Boolean;
 begin
   {
   HTTP/1.1 200 OK
@@ -239,12 +376,43 @@ begin
       case FParseState of
         psHeader:
           begin
+            // 严格 CRLF 状态机 (RFC 7230 §3): 拒绝 bare-CR / bare-LF, 防御请求走私.
+            // 老实现以 (FCRCount=2)+(FLFCount=2) 计数法判断 header 结束, 接受 \r\r\n\n
+            // 等非标准序列, 给上下游切分不一致留下走私空间.
             case LPtr^ of
-              13{\r}: Inc(FCRCount);
-              10{\n}: Inc(FLFCount);
+              13 {\r}:
+                begin
+                  case FHeaderCRLFState of
+                    hcsLineBody:   FHeaderCRLFState := hcsAfterCR;
+                    hcsAfterCRLF:  FHeaderCRLFState := hcsAfterCRLFCR;
+                  else
+                    // 状态 hcsAfterCR / hcsAfterCRLFCR: 上一字节已是 \r, 又来 \r
+                    _OnParseFailed(400, 'Bare CR in request header.');
+                    Exit;
+                  end;
+                end;
+              10 {\n}:
+                begin
+                  case FHeaderCRLFState of
+                    hcsAfterCR:     FHeaderCRLFState := hcsAfterCRLF;
+                    hcsAfterCRLFCR: FHeaderCRLFState := hcsHeaderDone;
+                  else
+                    // 状态 hcsLineBody / hcsAfterCRLF: 没有前导 \r 就来 \n
+                    _OnParseFailed(400, 'Bare LF in request header.');
+                    Exit;
+                  end;
+                end;
             else
-              FCRCount := 0;
-              FLFCount := 0;
+              case FHeaderCRLFState of
+                hcsLineBody, hcsAfterCRLF:
+                  FHeaderCRLFState := hcsLineBody; // 普通字节, 回到行内
+                hcsAfterCR, hcsAfterCRLFCR:
+                  begin
+                    // \r 后接非 \n
+                    _OnParseFailed(400, 'Bare CR in request header.');
+                    Exit;
+                  end;
+              end;
             end;
 
             // Header尺寸超标
@@ -261,8 +429,8 @@ begin
             {$ENDIF}
             Inc(LPtr);
 
-            // HTTP头已接收完毕(\r\n\r\n是HTTP头结束的标志)
-            if (FCRCount = 2) and (FLFCount = 2) then
+            // HTTP头已接收完毕(标准 \r\n\r\n)
+            if (FHeaderCRLFState = hcsHeaderDone) then
             begin
               {$IFDEF __MERGE_HEADER_WRITE__}
               // 写入请求数据
@@ -272,18 +440,41 @@ begin
 
               FCRCount := 0;
               FLFCount := 0;
+              FHeaderCRLFState := hcsLineBody;
 
               // 调用解码Header的回调
               _OnHeaderData(FHeaderStream.Memory, FHeaderStream.Size);
 
               // 数据体长度
-              _OnGetHeaderValue(HEADER_CONTENT_LENGTH, LContentLength);
+              LHasContentLength := _OnGetHeaderValues(HEADER_CONTENT_LENGTH, LContentLengthValues)
+                and (Length(LContentLengthValues) > 0);
+              if LHasContentLength then
+              begin
+                if (Length(LContentLengthValues) > 1) then
+                begin
+                  _OnParseFailed(400, 'Duplicate Content-Length.');
+                  Exit;
+                end;
+                LContentLength := LContentLengthValues[0];
+              end else
+                LContentLength := '';
 
               // 数据的编码方式
               // 只有一种编码方式: chunked
               // 如果 Transfer-Encoding 不存在于 Header 中, 则数据是连续的, 不采用分块编码
               // 理论上 Transfer-Encoding 和 Content-Length 只应该存在其中一个
-              _OnGetHeaderValue(HEADER_TRANSFER_ENCODING, FTransferEncoding);
+              LHasTransferEncoding := _OnGetHeaderValues(HEADER_TRANSFER_ENCODING, LTransferEncodingValues)
+                and (Length(LTransferEncodingValues) > 0);
+              if LHasTransferEncoding then
+              begin
+                if (Length(LTransferEncodingValues) <> 1) then
+                begin
+                  _OnParseFailed(400, 'Duplicate Transfer-Encoding.');
+                  Exit;
+                end;
+                FTransferEncoding := LTransferEncodingValues[0];
+              end else
+                FTransferEncoding := '';
 
               // 数据的压缩方式
               // 可能的值为: gzip deflate br 其中之一
@@ -293,8 +484,65 @@ begin
               // 读取响应头中连接保持方式
               _OnGetHeaderValue(HEADER_CONNECTION, FConnectionStr);
 
-              FContentLength := StrToInt64Def(LContentLength, -1);
-              FIsChunked := TStrUtils.SameText(FTransferEncoding, 'chunked');
+              if (FMode = pmServer) and LHasContentLength then
+              begin
+                // 使用专门的解析方法来处理 Content-Length，因为：
+                // 1. Content-Length 不允许出现重复 Header 行
+                //    例如: 两行 "Content-Length: 123" 是非法的
+                //    例如: "Content-Length: 123, 456" 是非法的(非单个十进制整数)
+                // 2. 需要严格校验数值的合法性(非负整数)
+                //    合法格式: "Content-Length: 0"
+                //    合法格式: "Content-Length: 1234"
+                //    非法格式: "Content-Length: -1" (负数)
+                //    非法格式: "Content-Length: abc" (非数字)
+                //    非法格式: "Content-Length: 12.34" (小数)
+                // 3. 需要处理空值或格式错误的情况
+                //    非法格式: "Content-Length: " (空值)
+                //    非法格式: "Content-Length: 123 456" (空格分隔)
+                if not _TryParseContentLengthValue(LContentLength, FContentLength) then
+                begin
+                  _OnParseFailed(400, 'Invalid Content-Length.');
+                  Exit;
+                end;
+              end else
+              if LHasContentLength then
+              begin
+                if not _TryParseContentLengthValue(LContentLength, FContentLength) then
+                  FContentLength := -1;
+              end else
+                FContentLength := -1;
+
+              if (FMode = pmServer) and LHasTransferEncoding then
+              begin
+                // 使用专门的解析方法来处理 Transfer-Encoding，因为：
+                // 1. Transfer-Encoding 可能包含多个编码方式(用逗号分隔)，需要验证格式
+                //    合法格式: "Transfer-Encoding: chunked"
+                //    非法格式: 重复的 "Transfer-Encoding: chunked" Header 行
+                //    非法格式: "Transfer-Encoding: gzip, chunked" (多种编码混合)
+                // 2. 根据 HTTP/1.1 规范，chunked 必须是最后一个编码方式
+                //    合法格式: "Transfer-Encoding: chunked"
+                //    非法格式: "Transfer-Encoding: chunked, gzip" (chunked 不在最后)
+                // 3. 需要严格校验编码名称的合法性(目前仅支持 chunked)
+                //    合法格式: "Transfer-Encoding: chunked"
+                //    非法格式: "Transfer-Encoding: compress" (不支持的编码)
+                //    非法格式: "Transfer-Encoding: " (空值)
+                // 4. 需要处理大小写不敏感的比较
+                //    合法格式: "Transfer-Encoding: CHUNKED"
+                if not _TryParseTransferEncodingValue(FTransferEncoding,
+                  LTransferEncoding, FIsChunked) then
+                begin
+                  _OnParseFailed(400, 'Invalid Transfer-Encoding.');
+                  Exit;
+                end;
+                FTransferEncoding := LTransferEncoding;
+              end else
+                FIsChunked := TStrUtils.SameText(FTransferEncoding, 'chunked');
+
+              if (FMode = pmServer) and LHasContentLength and LHasTransferEncoding then
+              begin
+                _OnParseFailed(400, 'Content-Length and Transfer-Encoding conflict.');
+                Exit;
+              end;
               if FNoBody then
               begin
                 FContentLength := 0;
@@ -391,14 +639,23 @@ begin
               FCRCount := 0;
               FLFCount := 0;
               FChunkSizeStream.Write(LPtr^, 1);
+              if (FChunkSizeStream.Size > MAX_CHUNK_SIZE_LINE) then
+              begin
+                _OnParseFailed(400, 'Invalid chunk size.');
+                Exit;
+              end;
             end;
             Inc(LPtr);
 
             if (FCRCount = 1) and (FLFCount = 1) then
             begin
               SetString(LLineStr, MarshaledAString(FChunkSizeStream.Memory), FChunkSizeStream.Size);
+              if not _TryParseChunkSizeLine(LLineStr, FChunkSize) then
+              begin
+                _OnParseFailed(400, 'Invalid chunk size.');
+                Exit;
+              end;
               FParseState := psChunkData;
-              FChunkSize := StrToIntDef('$' + Trim(LLineStr), -1);
               FChunkLeftSize := FChunkSize;
             end;
           end;
@@ -437,8 +694,10 @@ begin
               13{\r}: Inc(FCRCount);
               10{\n}: Inc(FLFCount);
             else
-              FCRCount := 0;
-              FLFCount := 0;
+              begin
+                _OnParseFailed(400, 'Invalid chunk data.');
+                Exit;
+              end;
             end;
             Inc(LPtr);
 
@@ -517,6 +776,7 @@ var
   LCompressType: TCompressType;
 begin
   FZCompressed := False;
+  FDecodedBodySize := 0;
   LCompressType := ctNone;
 
   // 根据 FContentEncoding(gzip deflate br) 判断使用哪种方式解压
@@ -545,6 +805,7 @@ begin
 
       if (inflateInit2(FZStream, ZLIB_WINDOW_BITS[LCompressType]) <> Z_OK) then
       begin
+        FZCompressed := False;
         _OnParseFailed(400, 'inflateInit2 failed');
         Exit;
       end;
@@ -596,6 +857,26 @@ begin
       // 已解压完成的数据大小
       FZOutSize := ZLIB_BUF_SIZE - FZStream.avail_out;
 
+      if (FMaxBodyDataSize > 0) and (FDecodedBodySize + FZOutSize > FMaxBodyDataSize) then
+      begin
+        _OnParseFailed(400, 'Post data too large.');
+        Exit;
+      end;
+
+      // 压缩比检查: 提前识别 zip bomb, 比 MaxBodyDataSize 更早截断
+      // 用 (FParsedBodySize + ADataSize) 作为输入字节上限分母, 保守估计
+      // 累计输出 <= MIN_DECOMPRESS_CHECK_BYTES 时跳过, 避免初期数据少时 ratio 失真
+      if (FMaxCompressRatio > 0)
+        and (FDecodedBodySize + FZOutSize > MIN_DECOMPRESS_CHECK_BYTES)
+        and (FDecodedBodySize + FZOutSize >
+             Int64(FParsedBodySize + ADataSize) * FMaxCompressRatio) then
+      begin
+        _OnParseFailed(400, 'Decompression ratio too high.');
+        Exit;
+      end;
+
+      Inc(FDecodedBodySize, FZOutSize);
+
       // 保存已解压的数据
       if (FZOutSize > 0) and Assigned(FOnBodyData) then
         FOnBodyData(@FZBuffer[0], FZOutSize);
@@ -608,22 +889,38 @@ end;
 procedure TCrossHttpParser._OnBodyEnd;
 begin
   if FZCompressed then
+  begin
     inflateEnd(FZStream);
+    FZCompressed := False;
+  end;
 
   if Assigned(FOnBodyEnd) then
     FOnBodyEnd();
 end;
 
-function TCrossHttpParser._OnGetHeaderValue(const AHeaderName: string;
-  out AHeaderValue: string): Boolean;
+function TCrossHttpParser._OnGetHeaderValues(const AHeaderName: string;
+  out AHeaderValues: TArray<string>): Boolean;
 begin
   if Assigned(FOnGetHeaderValue) then
-    Result := FOnGetHeaderValue(AHeaderName, AHeaderValue)
+    Result := FOnGetHeaderValue(AHeaderName, AHeaderValues)
   else
   begin
-    AHeaderValue := '';
+    SetLength(AHeaderValues, 0);
     Result := False;
   end;
+end;
+
+function TCrossHttpParser._OnGetHeaderValue(const AHeaderName: string;
+  out AHeaderValue: string): Boolean;
+var
+  LHeaderValues: TArray<string>;
+begin
+  Result := _OnGetHeaderValues(AHeaderName, LHeaderValues)
+    and (Length(LHeaderValues) > 0);
+  if Result then
+    AHeaderValue := LHeaderValues[0]
+  else
+    AHeaderValue := '';
 end;
 
 procedure TCrossHttpParser._OnHeaderData(const ADataPtr: Pointer;
@@ -642,6 +939,13 @@ end;
 procedure TCrossHttpParser._OnParseFailed(const ACode: Integer;
   const AError: string);
 begin
+  if FZCompressed then
+  begin
+    inflateEnd(FZStream);
+    FZCompressed := False;
+  end;
+  FreeAndNil(FChunkSizeStream);
+
   if Assigned(FOnParseFailed) then
     FOnParseFailed(ACode, AError);
 
@@ -658,9 +962,12 @@ procedure TCrossHttpParser._Reset;
 begin
   FParseState := psIdle;
   FHeaderStream.Clear;
+  FreeAndNil(FChunkSizeStream);
   FCRCount := 0;
   FLFCount := 0;
+  FHeaderCRLFState := hcsLineBody;
   FParsedBodySize := 0;
+  FDecodedBodySize := 0;
   FNoBody := False;
 end;
 
@@ -682,6 +989,16 @@ end;
 procedure TCrossHttpParser.SetMaxBodyDataSize(const AValue: Integer);
 begin
   FMaxBodyDataSize := AValue;
+end;
+
+function TCrossHttpParser.GetMaxCompressRatio: Integer;
+begin
+  Result := FMaxCompressRatio;
+end;
+
+procedure TCrossHttpParser.SetMaxCompressRatio(const AValue: Integer);
+begin
+  FMaxCompressRatio := AValue;
 end;
 
 function TCrossHttpParser.GetOnHeaderData: TOnHeaderData;

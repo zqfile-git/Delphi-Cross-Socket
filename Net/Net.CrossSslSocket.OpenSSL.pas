@@ -26,6 +26,7 @@ interface
 uses
   SysUtils,
   Classes,
+  Generics.Collections,
 
   Net.SocketAPI,
   Net.CrossSocket.Base,
@@ -42,10 +43,30 @@ type
   { TCrossOpenSslConnection }
 
   TCrossOpenSslConnection = class(TCrossSslConnectionBase)
+  private type
+    // pending write 队列条目: 零拷贝, 仅保存上层传入的指针.
+    // 调用方需保证 Buf 在 Callback 触发前持续有效 (异步框架契约).
+    TPendingWrite = record
+      Buf: PByte;
+      Len: Integer;
+      Callback: TCrossConnectionCallback;
+    end;
   private
     FSslData: PSSL;
     FBIOIn, FBIOOut: PBIO;
     FLock: ILock;
+    // 握手阶段累计输入字节数: 仅在 csHandshaking 时累加, 超过
+    // MAX_HANDSHAKE_RECV_BYTES 即视作 DoS 主动 fatal close. 防御
+    // "反复发送握手字节耗费 SSL 状态机"型 DoS.
+    FHandshakeRecvBytes: Int64;
+
+    // pending write 队列: BIO 空 + WANT_* 时把待写明文挂起,
+    // 等 TriggerReceived 推进 SSL 状态后由 _PumpPendingWrites 唤醒.
+    // FIFO 顺序保证 SSL 状态机不会被穿插数据弄乱.
+    FPendingWrites: TQueue<TPendingWrite>;
+    FPendingBytes: Int64;       // 已挂起明文字节数 (用于背压判定)
+    FMaxPendingBytes: Int64;    // 上限 (从 Owner 复制, 0 = 不限)
+    FPumping: Boolean;          // 正在 pump 标志 (单 pumper 不变量)
 
     procedure _Lock; inline;
     procedure _Unlock; inline;
@@ -67,9 +88,28 @@ type
       out AErrCode: Integer): Boolean; overload;
     function _SSL_handle_error(const ARetCode: Integer; const AOperation: string): Boolean; overload;
 
-    // SSL数据发送(递归实现)
+    // SSL数据发送 (薄入口: 检查 pending queue, 否则交给 _SslSendInner 推进)
     procedure _SslSend(const ABuf: PByte; const ALen: Integer;
       const ACallback: TCrossConnectionCallback);
+
+    // _SslSend 主体: 状态机 + CPS 循环, BIO 空 + WANT_* 时入队挂起
+    procedure _SslSendInner(const ABuf: PByte; const ALen: Integer;
+      const ACallback: TCrossConnectionCallback);
+
+    // 尝试入队 pending write (必须在 FLock 内调用).
+    // 返回 True=已入队 / False=背压拒绝 (调用方应 fail callback).
+    function _TryEnqueuePendingWrite(const ABuf: PByte; const ALen: Integer;
+      const ACallback: TCrossConnectionCallback): Boolean;
+
+    // 唤醒 pending write 队列首条目, 推进完成后由 callback 触发下一轮 pump.
+    // 由 TriggerReceived 在 SSL 状态推进 (BIO_write/SSL_read/握手) 后调用.
+    procedure _PumpPendingWrites;
+
+    // 把 queue 中所有挂起条目以 fail 通知上层 (析构 / pump 推进失败时调用),
+    // 调用方需保证当前线程不持有 FLock.
+    // AConnection 用作 callback 的第一参数: 析构路径传 nil (避免引用计数环)
+    // 其他路径传 Self as ICrossConnection.
+    procedure _DrainPendingWritesAsFailed(const AConnection: ICrossConnection);
 
     procedure _Send(const ABuffer: Pointer; const ACount: Integer;
       const ACallback: TCrossConnectionCallback = nil); overload;
@@ -122,6 +162,18 @@ type
 
 implementation
 
+const
+  /// <summary>
+  ///   SSL 握手累计输入字节上限.
+  /// </summary>
+  /// <remarks>
+  ///   TLS 1.3 完整握手 (含证书链 + ALPN + SNI) 通常 8-32 KB.
+  ///   含客户端证书的双向 mTLS 极端场景 < 64 KB.
+  ///   设 128 KB 留足保护合法场景, 同时阻断"反复发送握手字节耗费 SSL 状态机"
+  ///   类的 DoS 攻击 (攻击者不断发送数 KB 数据让服务端反复运行 SSL_do_handshake).
+  /// </remarks>
+  MAX_HANDSHAKE_RECV_BYTES = 128 * 1024;
+
 { TCrossOpenSslConnection }
 
 constructor TCrossOpenSslConnection.Create(const AOwner: TCrossSocketBase;
@@ -138,6 +190,9 @@ begin
     FBIOOut := BIO_new(BIO_s_mem());
     SSL_set_bio(FSslData, FBIOIn, FBIOOut);
 
+    FPendingWrites := TQueue<TPendingWrite>.Create;
+    FMaxPendingBytes := TCrossOpenSslSocket(AOwner).SslMaxPendingWriteBytes;
+
     if (ConnectType = ctAccept) then
       SSL_set_accept_state(FSslData)   // 服务端连接
     else
@@ -152,6 +207,15 @@ destructor TCrossOpenSslConnection.Destroy;
 begin
   if Ssl then
   begin
+    // pending writes 析构 drain: 把所有挂起 callback 以 fail 通知上层,
+    // 上层闭包持有的 TBytes 才能释放 (零拷贝契约). 传 nil connection 避免
+    // (Self as ICrossConnection) 引起的 refcount 环 → 二次析构.
+    if (FPendingWrites <> nil) then
+    begin
+      _DrainPendingWritesAsFailed(nil);
+      FPendingWrites.Free;
+    end;
+
     if (SSL_shutdown(FSslData) = 0) then
       SSL_shutdown(FSslData);
     SSL_free(FSslData);
@@ -385,12 +449,41 @@ begin
     end);
 end;
 
+function TCrossOpenSslConnection._TryEnqueuePendingWrite(const ABuf: PByte;
+  const ALen: Integer; const ACallback: TCrossConnectionCallback): Boolean;
+// 尝试入队 pending write, 必须在 FLock 内调用.
+// 返回 True=已入队 / False=背压拒绝 (调用方应 fail callback).
+//
+// 零拷贝: 仅保存 PByte 指针, 上层调用方需保证 callback 触发前 buffer 有效
+// (异步框架契约, 已被 _Send(TBytes) 重载等所遵循).
+var
+  LItem: TPendingWrite;
+begin
+  // 背压: 超限则不入队, 由调用方 fail callback (上层闭包持有的 TBytes 可释放)
+  if (FMaxPendingBytes > 0)
+    and (FPendingBytes + ALen > FMaxPendingBytes) then
+    Exit(False);
+
+  LItem.Buf := ABuf;
+  LItem.Len := ALen;
+  LItem.Callback := ACallback;
+  FPendingWrites.Enqueue(LItem);
+  Inc(FPendingBytes, ALen);
+  Result := True;
+end;
+
 procedure TCrossOpenSslConnection._SslSend(const ABuf: PByte;
   const ALen: Integer; const ACallback: TCrossConnectionCallback);
+// SSL 数据写入薄入口: 检查 pending queue 顺序约束, 否则直接转 _SslSendInner.
+//
+// 关键不变量: 若 queue 中已有挂起条目 (或正在 pump), 新调用必须排队保持 FIFO,
+// 否则会与 pumping 中的数据穿插, 弄乱 SSL 状态机.
+//
+// 零拷贝: 仅保存 PByte 指针, 上层调用方需保证 callback 触发前 buffer 有效
+// (异步框架契约, 已被 _Send(TBytes) 重载等所遵循).
 var
   LConnection: ICrossConnection;
-  LWritten, LErrCode: Integer;
-  LEncryptedData: TBytes;
+  LEnqueued, LBackpressureFail: Boolean;
 begin
   LConnection := Self as ICrossConnection;
 
@@ -401,77 +494,249 @@ begin
     Exit;
   end;
 
+  // 已有挂起或 pumping 中: 排队保持 FIFO, 不与 pumping 数据竞争 SSL 状态
+  LEnqueued := False;
+  LBackpressureFail := False;
+
   _Lock;
   try
-    // 尝试写入数据到SSL
-    LWritten := _SSL_write(ABuf, ALen);
-
-    if (LWritten > 0) then
+    if (FPendingWrites <> nil)
+      and ((FPendingWrites.Count > 0) or FPumping) then
     begin
-      // 成功写入部分或全部数据
-      // 获取加密后的数据并发送
-      LEncryptedData := _BIO_read_all;
-      if (LEncryptedData <> nil) then
-      begin
-        _Send(@LEncryptedData[0], Length(LEncryptedData),
-          procedure(const AConnection: ICrossConnection; const ASuccess: Boolean)
-          begin
-            if ASuccess then
-            begin
-              // 网络发送成功, 检查是否还有剩余数据
-              if (LWritten < ALen) then
-                // 递归调用处理剩余数据
-                _SslSend(ABuf + LWritten, ALen - LWritten, ACallback)
-              else if Assigned(ACallback) then
-                ACallback(LConnection, True);
-            end else
-            if Assigned(ACallback) then
-              ACallback(LConnection, False);
-          end);
-      end else
-      begin
-        // 没有加密数据要发送, 直接递归处理剩余数据
-        if (LWritten < ALen) then
-          _SslSend(ABuf + LWritten, ALen - LWritten, ACallback)
-        else if Assigned(ACallback) then
-          ACallback(LConnection, True);
-      end;
-    end else
-    begin
-      // SSL写入失败
-      if not _SSL_handle_error(LWritten, 'SSL_write', LErrCode) then
-      begin
-        if (LErrCode in [SSL_ERROR_WANT_READ, SSL_ERROR_WANT_WRITE]) then
-        begin
-          // 可重试错误, 先发送BIO中已有的数据
-          LEncryptedData := _BIO_read_all;
-          if (LEncryptedData <> nil) then
-          begin
-            _Send(@LEncryptedData[0], Length(LEncryptedData),
-              procedure(const AConnection: ICrossConnection; const ASuccess: Boolean)
-              begin
-                if ASuccess then
-                  // 网络发送成功后, 重试SSL写入
-                  _SslSend(ABuf, ALen, ACallback)
-                else if Assigned(ACallback) then
-                  ACallback(LConnection, False);
-              end);
-          end else
-          begin
-            // 没有数据要发送, 直接重试
-            _SslSend(ABuf, ALen, ACallback);
-          end;
-        end;
-      end else
-      begin
-        // 致命错误
-        if Assigned(ACallback) then
-          ACallback(LConnection, False);
-      end;
+      LEnqueued := _TryEnqueuePendingWrite(ABuf, ALen, ACallback);
+      LBackpressureFail := not LEnqueued;
     end;
   finally
     _Unlock;
   end;
+
+  if LBackpressureFail then
+  begin
+    if Assigned(ACallback) then
+      ACallback(LConnection, False);
+    Exit;
+  end;
+
+  if LEnqueued then Exit;  // 等 _PumpPendingWrites 唤醒
+
+  _SslSendInner(ABuf, ALen, ACallback);
+end;
+
+procedure TCrossOpenSslConnection._SslSendInner(const ABuf: PByte;
+  const ALen: Integer; const ACallback: TCrossConnectionCallback);
+// SSL 数据写入主体: 状态机 + CPS 实现.
+//
+// 设计要点:
+//   1. while 真循环替代锁内同步递归:
+//      - BIO 空 + 部分写入: Continue 推进, 不再加锁、不再递归.
+//      - BIO 空 + WANT_READ/WANT_WRITE: 入队挂起 (步骤 5 实现), 等
+//        TriggerReceived 推进 SSL 状态后由 _PumpPendingWrites 唤醒.
+//   2. _Send 异步调用 (callback 跨线程触发) 通过 CPS 处理;
+//      发起 _Send 前先 _Unlock, 破除"锁-网络嵌套".
+var
+  LConnection: ICrossConnection;
+  LCurBuf: PByte;
+  LRemaining: Integer;
+  LWritten, LErrCode: Integer;
+  LEncryptedData: TBytes;
+  LFatal, LBackpressureFail: Boolean;
+begin
+  LConnection := Self as ICrossConnection;
+
+  if (ALen <= 0) then
+  begin
+    if Assigned(ACallback) then
+      ACallback(LConnection, True);
+    Exit;
+  end;
+
+  LCurBuf := ABuf;
+  LRemaining := ALen;
+
+  while (LRemaining > 0) do
+  begin
+    LEncryptedData := nil;
+    LFatal := False;
+    LErrCode := 0;
+
+    // ---- 锁内: 仅做 SSL/BIO 状态机操作 ----
+    _Lock;
+    try
+      LWritten := _SSL_write(LCurBuf, LRemaining);
+
+      if (LWritten > 0) then
+      begin
+        // 成功写入 (部分或全部), 取出加密后数据准备发送
+        LEncryptedData := _BIO_read_all;
+      end else
+      begin
+        // SSL_write 返回 <= 0
+        if _SSL_handle_error(LWritten, 'SSL_write', LErrCode) then
+          LFatal := True
+        else if (LErrCode in [SSL_ERROR_WANT_READ, SSL_ERROR_WANT_WRITE]) then
+          // 可重试错误: BIO 仍可能有待 flush 的数据
+          LEncryptedData := _BIO_read_all
+        else
+          // 未识别错误码视为致命
+          LFatal := True;
+      end;
+    finally
+      _Unlock;
+    end;
+
+    // ---- 锁外: 处理结果 / 发起异步 IO ----
+    if LFatal then
+    begin
+      if Assigned(ACallback) then
+        ACallback(LConnection, False);
+      Exit;
+    end;
+
+    if (LEncryptedData <> nil) then
+    begin
+      // 锁外发起异步发送, callback 内 CPS 继续推进 (新栈帧, 不在原栈上)
+      _Send(@LEncryptedData[0], Length(LEncryptedData),
+        procedure(const AConnection: ICrossConnection; const ASuccess: Boolean)
+        begin
+          if not ASuccess then
+          begin
+            if Assigned(ACallback) then
+              ACallback(AConnection, False);
+            Exit;
+          end;
+
+          if (LWritten > 0) then
+          begin
+            if (LWritten < LRemaining) then
+              // 部分写入, CPS 推进剩余数据 (新栈帧, 非同步递归)
+              _SslSend(LCurBuf + LWritten, LRemaining - LWritten, ACallback)
+            else if Assigned(ACallback) then
+              ACallback(AConnection, True);
+          end else
+          begin
+            // LWritten <= 0 (WANT_READ/WANT_WRITE) + BIO 已 flush:
+            //   BIO flush 后 OpenSSL 内部状态可能变化 (例如 WANT_WRITE 的
+            //   底层 buffer 被释放), 重试 _SslSend 有机会继续推进.
+            //   这是合法的 CPS 递归 (异步 callback, 新栈帧):
+            //     若再次 WANT_* + BIO 非空 → 再次 _Send + 重试, 终究会因
+            //     BIO 空 + WANT_* 走到主循环失败分支退出, 不会无限递归.
+            _SslSend(LCurBuf, LRemaining, ACallback);
+          end;
+        end);
+      Exit; // 等待异步 callback
+    end;
+
+    // ---- BIO 空的情况 ----
+    if (LWritten > 0) then
+    begin
+      // 部分写入但 BIO 无输出 (罕见但合法), 真循环推进, 不再加锁递归.
+      Inc(LCurBuf, LWritten);
+      Dec(LRemaining, LWritten);
+      Continue;
+    end;
+
+    // BIO 空 + WANT_READ/WANT_WRITE: 真挂起场景.
+    // 同步重试无效 (OpenSSL 状态未变化), 必须等 TriggerReceived 注入新数据 →
+    // BIO_write 推进 SSL 状态后, _PumpPendingWrites 才能解除阻塞.
+    //
+    // 入队规则: 零拷贝, 仅保存 (LCurBuf, LRemaining, ACallback);
+    // 上层调用方需保证 buffer 在 callback 前持续有效 (异步框架契约).
+    // 背压: FPendingBytes 超 FMaxPendingBytes 则不入队, 直接 fail callback.
+    _Lock;
+    try
+      LBackpressureFail := not _TryEnqueuePendingWrite(LCurBuf, LRemaining, ACallback);
+    finally
+      _Unlock;
+    end;
+
+    if LBackpressureFail then
+    begin
+      if Assigned(ACallback) then
+        ACallback(LConnection, False);
+    end;
+    // 否则: 已入队, 等 _PumpPendingWrites 唤醒后触发 callback
+    Exit;
+  end;
+
+  // LRemaining = 0, 全部数据已写入
+  if Assigned(ACallback) then
+    ACallback(LConnection, True);
+end;
+
+procedure TCrossOpenSslConnection._PumpPendingWrites;
+// 唤醒 pending write 队列首条目, 由 TriggerReceived 在 SSL 状态推进后调用.
+//
+// 单 pumper 不变量: FPumping 标志确保任意时刻只有一个 pumper 推进 queue,
+// 防止并发 pump 引起 SSL 状态机交叉数据.
+//
+// 推进路径: 取出首条目, 锁外调 _SslSendInner; callback 内清除 FPumping,
+// 成功则递归 pump 下一个 (锁外异步, 不会同步深递归), 失败则 drain 剩余条目.
+var
+  LItem: TPendingWrite;
+begin
+  _Lock;
+  try
+    if FPumping then Exit;
+    if (FPendingWrites = nil) or (FPendingWrites.Count = 0) then Exit;
+    FPumping := True;
+    LItem := FPendingWrites.Dequeue;
+    Dec(FPendingBytes, LItem.Len);
+  finally
+    _Unlock;
+  end;
+
+  // 锁外推进首个条目, callback 内继续 pump 下一个或 drain
+  _SslSendInner(LItem.Buf, LItem.Len,
+    procedure(const AConnection: ICrossConnection; const ASuccess: Boolean)
+    begin
+      if Assigned(LItem.Callback) then
+        LItem.Callback(AConnection, ASuccess);
+
+      _Lock;
+      try
+        FPumping := False;
+      finally
+        _Unlock;
+      end;
+
+      if ASuccess then
+        _PumpPendingWrites    // 推进下一个 (锁外异步)
+      else
+        _DrainPendingWritesAsFailed(AConnection);  // 失败: 后续 pending 全 fail
+    end);
+end;
+
+procedure TCrossOpenSslConnection._DrainPendingWritesAsFailed(
+  const AConnection: ICrossConnection);
+// 把 queue 中所有挂起条目以 fail 通知上层.
+//
+// 锁内仅做"快速搬运" (Dequeue 到本地 array), 避免锁内调 callback 引起
+// 重入 / 死锁. 锁外依次触发 callback, 上层闭包将释放持有的 TBytes.
+//
+// AConnection 由调用方决定:
+//   - 析构路径传 nil: 避免 (Self as ICrossConnection) 引起 refcount 环 → 二次析构
+//   - pump 失败路径传 callback 收到的 AConnection (已是有效引用)
+var
+  LDrained: TArray<TPendingWrite>;
+  I, LCount: Integer;
+begin
+  LDrained := nil;
+
+  _Lock;
+  try
+    if (FPendingWrites = nil) or (FPendingWrites.Count = 0) then Exit;
+    LCount := FPendingWrites.Count;
+    SetLength(LDrained, LCount);
+    for I := 0 to LCount - 1 do
+      LDrained[I] := FPendingWrites.Dequeue;
+    FPendingBytes := 0;
+  finally
+    _Unlock;
+  end;
+
+  for I := 0 to High(LDrained) do
+    if Assigned(LDrained[I].Callback) then
+      LDrained[I].Callback(AConnection, False);
 end;
 
 { TCrossOpenSslSocket }
@@ -628,12 +893,14 @@ var
   LConnection: TCrossOpenSslConnection;
   LRetCode: Integer;
   LHandshakeData: TBytes;
+  LFatal: Boolean;
 begin
   LConnection := AConnection as TCrossOpenSslConnection;
 
   if Ssl then
   begin
     LHandshakeData := nil;
+    LFatal := False;
 
     LConnection._Lock;
     try
@@ -646,8 +913,10 @@ begin
       // 需要在 TriggerReceived 中检查握手状态, 握手没完成就还需要调用 SSL_do_handshake
       LRetCode := LConnection._SSL_do_handshake;
       if (LRetCode <> 1) then
-        LConnection._SSL_handle_error(LRetCode, 'SSL_do_handshake(TriggerConnected)');
+        LFatal := LConnection._SSL_handle_error(LRetCode,
+          'SSL_do_handshake(TriggerConnected)');
 
+      // 即使握手 fatal, 也读出 BIO 中可能的 TLS alert 发给对端 (RFC 5246 §7.2)
       LHandshakeData := LConnection._BIO_read_all;
     finally
       LConnection._Unlock;
@@ -655,6 +924,11 @@ begin
 
     if (LHandshakeData <> nil) then
       LConnection._Send(LHandshakeData);
+
+    // 握手 fatal: 锁外关闭连接, 避免连接停滞在 csHandshaking 占用资源.
+    // 握手输入字节限制由 TriggerReceived 中累加 + 阈值检查实现.
+    if LFatal then
+      LConnection.Close;
   end else
     _Connected(LConnection);
 end;
@@ -666,6 +940,7 @@ var
   LRetCode: Integer;
   LTriggerConnected: Boolean;
   LDecryptedData, LHandshakeData: TBytes;
+  LFatal: Boolean;
 begin
   if Ssl then
   begin
@@ -673,46 +948,62 @@ begin
     LTriggerConnected := False;
     LDecryptedData := nil;
     LHandshakeData := nil;
+    LFatal := False;
 
     LConnectionObj._Lock;
     try
-      // 将收到的加密数据写入内存 BIO, 让 OpenSSL 对其解密
-      // 最初收到的数据是握手数据
-      // 需要判断握手状态, 然后决定如何使用收到的数据
-      LRetCode := LConnectionObj._BIO_write(ABuf, ALen);
-      if (LRetCode <> ALen) then
-      begin
-        if LConnectionObj._SSL_handle_error(LRetCode, 'BIO_write') then
-          LConnectionObj.Close;
-        Exit;
-      end;
-
-      // 握手完成
-      if (LConnectionObj._SSL_is_init_finished = TLS_ST_OK) then
-      begin
-        if (LConnectionObj.ConnectStatus = csHandshaking) then
-          LTriggerConnected := True;
-
-        // 读取解密后的数据
-        LDecryptedData := LConnectionObj._SSL_read_all;
-      end else
+      // 握手阶段输入字节限制:
+      //   仅在握手未完成时累加, 超阈值即视作 DoS 直接 fatal close.
+      //   握手成功后切换到正常数据流, 不再受此限制.
       if (LConnectionObj.ConnectStatus = csHandshaking) then
       begin
-        // 继续握手
-        LRetCode := LConnectionObj._SSL_do_handshake;
+        Inc(LConnectionObj.FHandshakeRecvBytes, ALen);
+        if (LConnectionObj.FHandshakeRecvBytes > MAX_HANDSHAKE_RECV_BYTES) then
+          LFatal := True;
+      end;
 
-        if (LRetCode <> 1) then
-          LConnectionObj._SSL_handle_error(LRetCode, 'SSL_do_handshake(TriggerReceived)');
-
-        // 读取握手数据
-        LHandshakeData := LConnectionObj._BIO_read_all;
-
-        // 如果握手完成
-        // 读取解密后的数据
-        if (LRetCode = 1) then
+      if not LFatal then
+      begin
+        // 将收到的加密数据写入内存 BIO, 让 OpenSSL 对其解密
+        // 最初收到的数据是握手数据
+        // 需要判断握手状态, 然后决定如何使用收到的数据
+        LRetCode := LConnectionObj._BIO_write(ABuf, ALen);
+        if (LRetCode <> ALen) then
         begin
-          LTriggerConnected := True;
+          // BIO_write 失败 fatal: 标记后到锁外 Close (避免锁内 Close 重入风险)
+          if LConnectionObj._SSL_handle_error(LRetCode, 'BIO_write') then
+            LFatal := True;
+        end else
+        // 握手完成
+        if (LConnectionObj._SSL_is_init_finished = TLS_ST_OK) then
+        begin
+          if (LConnectionObj.ConnectStatus = csHandshaking) then
+            LTriggerConnected := True;
+
+          // 读取解密后的数据
           LDecryptedData := LConnectionObj._SSL_read_all;
+        end else
+        if (LConnectionObj.ConnectStatus = csHandshaking) then
+        begin
+          // 继续握手
+          LRetCode := LConnectionObj._SSL_do_handshake;
+
+          if (LRetCode <> 1) then
+            // 握手 fatal: 标记后到锁外 Close, 避免连接停滞 csHandshaking
+            if LConnectionObj._SSL_handle_error(LRetCode,
+                'SSL_do_handshake(TriggerReceived)') then
+              LFatal := True;
+
+          // 即使 fatal 也读出 BIO, 含可能的 TLS alert 发给对端 (RFC 5246 §7.2)
+          LHandshakeData := LConnectionObj._BIO_read_all;
+
+          // 如果握手完成
+          // 读取解密后的数据
+          if (LRetCode = 1) then
+          begin
+            LTriggerConnected := True;
+            LDecryptedData := LConnectionObj._SSL_read_all;
+          end;
         end;
       end;
     finally
@@ -722,7 +1013,8 @@ begin
     // 有握手数据
     if (LHandshakeData <> nil) then
     begin
-      // 先把握手数据发出去再触发连接事件和数据接收事件
+      // 先把握手数据发出去再触发连接事件和数据接收事件;
+      // fatal 时 alert 数据也通过这里发送, 发送完成后再 Close (优雅关闭)
       LConnectionObj._Send(LHandshakeData,
         procedure(const AConnection: ICrossConnection; const ASuccess: Boolean)
         begin
@@ -736,6 +1028,13 @@ begin
             _Received(AConnection, @LDecryptedData[0], Length(LDecryptedData));
             LDecryptedData := nil;
           end;
+
+          // 握手 fatal: alert 已发出, 关闭连接释放资源
+          if LFatal then
+            AConnection.Close
+          else
+            // SSL 状态推进 (BIO_write 注入 + 握手数据已发) 后唤醒 pending writes
+            LConnectionObj._PumpPendingWrites;
         end);
     end else
     begin
@@ -746,6 +1045,13 @@ begin
       // 收到了解密后的数据
       if (LDecryptedData <> nil) then
         _Received(AConnection, @LDecryptedData[0], Length(LDecryptedData));
+
+      // BIO_write fatal / 握手 fatal / 握手字节超限: 直接 Close 释放资源.
+      if LFatal then
+        LConnectionObj.Close
+      else
+        // SSL 状态推进 (BIO_write 注入 + SSL_read 完成) 后唤醒 pending writes
+        LConnectionObj._PumpPendingWrites;
     end;
   end else
     _Received(AConnection, ABuf, ALen);

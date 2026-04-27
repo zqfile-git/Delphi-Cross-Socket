@@ -390,7 +390,8 @@ type
       const AConnectCb: TCrossConnectionCallback): ICrossConnection; override;
     procedure LogicDisconnected(const AConnection: ICrossConnection); override;
 
-    procedure DoOnRequest(const AConnection: ICrossHttpConnection); override;
+    procedure DoOnRequest(const AConnection: ICrossHttpConnection;
+      const ARequest: ICrossHttpRequest; const AResponse: ICrossHttpResponse); override;
   public
     constructor Create(const AIoThreads: Integer; const ASsl: Boolean); override;
     destructor Destroy; override;
@@ -982,7 +983,8 @@ begin
 end;
 
 procedure TCrossWebSocketServer.DoOnRequest(
-  const AConnection: ICrossHttpConnection);
+  const AConnection: ICrossHttpConnection;
+  const ARequest: ICrossHttpRequest; const AResponse: ICrossHttpResponse);
 var
   LConnection: ICrossWebSocketConnection;
   LConnectionObj: TCrossWebSocketConnection;
@@ -1000,9 +1002,9 @@ begin
     Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==
     Sec-WebSocket-Version: 13
   }
-  // 判断是否收到 websocket 握手请求
-  if ContainsText(LConnection.Request.Header[HEADER_UPGRADE], WEBSOCKET)
-    and ContainsText(LConnection.Request.Header[HEADER_CONNECTION], HEADER_UPGRADE) then
+  // 判断是否收到 websocket 握手请求, 直接使用入参 request 避免读取连接字段
+  if ContainsText(ARequest.Header[HEADER_UPGRADE], WEBSOCKET)
+    and ContainsText(ARequest.Header[HEADER_CONNECTION], HEADER_UPGRADE) then
   begin
     LConnectionObj.FIsWebSocket := True;
     _WebSocketHandshake(LConnection,
@@ -1012,7 +1014,7 @@ begin
           _OnOpen(AConnection);
       end);
   end else
-    inherited DoOnRequest(LConnection);
+    inherited DoOnRequest(LConnection, ARequest, AResponse);
 end;
 
 function TCrossWebSocketServer.GetMaskingKey: Cardinal;

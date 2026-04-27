@@ -2111,43 +2111,49 @@ end;
 
 class procedure TSSLTools.SetCertificate(AContext: PSSL_CTX; ACertBuf: Pointer;
   ACertBufSize: Integer);
+// 异常路径资源释放:
+//   BIO 全流程 try/finally; 每个 X509 在本轮 finally 释放,
+//   保证中间任一步 raise 都不泄漏 BIO/X509.
 var
   LBIOCert: PBIO;
   LSSLCert: PX509;
   LStore: PX509_STORE;
 begin
-	LBIOCert := BIO_new_mem_buf(ACertBuf, ACertBufSize);
+  LBIOCert := BIO_new_mem_buf(ACertBuf, ACertBufSize);
   if (LBIOCert = nil) then
     raise ESsl.Create('Failed to allocate certificate cache.');
-
-	LSSLCert := PEM_read_bio_X509_AUX(LBIOCert, nil, nil, nil);
-  if (LSSLCert = nil) then
-    raise ESsl.Create('Failed to read certificate data.');
-
-	if (SSL_CTX_use_certificate(AContext, LSSLCert) <= 0) then
-    raise ESsl.Create('Failed to use certificate.');
-
-	X509_free(LSSLCert);
-
-  LStore := SSL_CTX_get_cert_store(AContext);
-  if (LStore = nil) then
-    raise ESsl.Create('Failed to retrieve certificate store.');
-
-  // 将证书链中剩余的证书添加到仓库中
-  // 有完整证书链在 ssllabs.com 评分中才能评为 A
-  while not BIO_eof(LBIOCert) do
-  begin
-  	LSSLCert := PEM_read_bio_X509(LBIOCert, nil, nil, nil);
+  try
+    LSSLCert := PEM_read_bio_X509_AUX(LBIOCert, nil, nil, nil);
     if (LSSLCert = nil) then
       raise ESsl.Create('Failed to read certificate data.');
+    try
+      if (SSL_CTX_use_certificate(AContext, LSSLCert) <= 0) then
+        raise ESsl.Create('Failed to use certificate.');
+    finally
+      X509_free(LSSLCert);
+    end;
 
-    if (X509_STORE_add_cert(LStore, LSSLCert) <= 0) then
-      raise ESsl.Create('Failed to add certificate to the store.');
+    LStore := SSL_CTX_get_cert_store(AContext);
+    if (LStore = nil) then
+      raise ESsl.Create('Failed to retrieve certificate store.');
 
-  	X509_free(LSSLCert);
+    // 将证书链中剩余的证书添加到仓库中
+    // 有完整证书链在 ssllabs.com 评分中才能评为 A
+    while not BIO_eof(LBIOCert) do
+    begin
+      LSSLCert := PEM_read_bio_X509(LBIOCert, nil, nil, nil);
+      if (LSSLCert = nil) then
+        raise ESsl.Create('Failed to read certificate data.');
+      try
+        if (X509_STORE_add_cert(LStore, LSSLCert) <= 0) then
+          raise ESsl.Create('Failed to add certificate to the store.');
+      finally
+        X509_free(LSSLCert);
+      end;
+    end;
+  finally
+    BIO_free(LBIOCert);
   end;
-
-	BIO_free(LBIOCert);
 end;
 
 class procedure TSSLTools.SetCertificate(AContext: PSSL_CTX;
@@ -2170,23 +2176,28 @@ end;
 
 class procedure TSSLTools.SetPrivateKey(AContext: PSSL_CTX; APKeyBuf: Pointer;
   APKeyBufSize: Integer);
+// 异常路径资源释放: BIO 与 EVP_PKEY 全流程 try/finally,
+// 保证中间任一步 raise 都不泄漏.
 var
   LBIOKey: PBIO;
   LSSLPKey: PEVP_PKEY;
 begin
-	LBIOKey := BIO_new_mem_buf(APKeyBuf, APKeyBufSize);
+  LBIOKey := BIO_new_mem_buf(APKeyBuf, APKeyBufSize);
   if (LBIOKey = nil) then
     raise ESsl.Create('Failed to allocate private key cache.');
-
-	LSSLPKey := PEM_read_bio_PrivateKey(LBIOKey, nil, nil, nil);
-  if (LSSLPKey = nil) then
-    raise ESsl.Create('Failed to read private key data.');
-
-	if (SSL_CTX_use_PrivateKey(AContext, LSSLPKey) <= 0) then
-    raise ESsl.Create('Failed to use private key.');
-
-	EVP_PKEY_free(LSSLPKey);
-	BIO_free(LBIOKey);
+  try
+    LSSLPKey := PEM_read_bio_PrivateKey(LBIOKey, nil, nil, nil);
+    if (LSSLPKey = nil) then
+      raise ESsl.Create('Failed to read private key data.');
+    try
+      if (SSL_CTX_use_PrivateKey(AContext, LSSLPKey) <= 0) then
+        raise ESsl.Create('Failed to use private key.');
+    finally
+      EVP_PKEY_free(LSSLPKey);
+    end;
+  finally
+    BIO_free(LBIOKey);
+  end;
 
   if (SSL_CTX_check_private_key(AContext) <= 0) then
     raise ESsl.Create('Private key does not match the public key of the certificate.');

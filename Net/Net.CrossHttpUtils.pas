@@ -1243,7 +1243,28 @@ type
     class function HtmlEncode(const AInput: string): string; static;
     class function HtmlDecode(const AInput: string): string; static;
 
-    class function UrlEncode(const S: string; const ANoConversion: TSysCharSet = []): string; static;
+    /// <summary>
+    ///   URL percent-encoding (RFC 3986 §2.1)
+    /// </summary>
+    /// <param name="S">
+    ///   待编码字符串(支持 unicode, 内部统一按 UTF-8 字节流处理)
+    /// </param>
+    /// <param name="ANoConversion">
+    ///   附加的"无需编码"字符集. 默认仅按 RFC 3986 unreserved 集
+    ///   (ALPHA / DIGIT / "-" / "." / "_" / "~") 不编码, 其他字符全部 percent-encode.
+    ///   调用方可据 URI 组件传入合理子集, 如 path 段内可保留 ['/', ':', '@'].
+    /// </param>
+    /// <param name="APreserveEncoded">
+    ///   是否将输入按"已含 percent-encoded 序列的 URI 组件"对待 (Normalizer 语义).
+    ///   - False (默认, Encoder 语义): 输入视作原始数据, '%' 字符按字面编码为 '%25'.
+    ///     适用于参数值/表单字段等"原始字节"场景. 与 RFC 3986 §2.1 Encoder 语义、
+    ///     主流库 (Go QueryEscape / Python quote / Java URLEncoder) 默认行为一致.
+    ///   - True (Normalizer 语义): 遇到 '%' + 2 hex 数字时保留 3 字符不再编码,
+    ///     避免二次编码 (RFC 3986 §2.4 "MUST NOT encode the same string more than once").
+    ///     适用于"用户传入的 URL 片段可能已部分编码"场景, 类似 Python requote_uri.
+    /// </param>
+    class function UrlEncode(const S: string; const ANoConversion: TSysCharSet = [];
+      const APreserveEncoded: Boolean = False): string; static;
     class function UrlDecode(const S: string): string; static;
 
     // Delphi 12+ 编译器将NativeInt与Integer(目标32位)和Int64(目标64位)等同
@@ -1252,6 +1273,65 @@ type
     {$ENDIF}
     class procedure AdjustOffsetCount(const ABodySize: Integer; var AOffset, ACount: Integer); overload; static;
     class procedure AdjustOffsetCount(const ABodySize: Int64; var AOffset, ACount: Int64); overload; static;
+
+    /// <summary>
+    ///   严格解析 HTTP Range 请求头中的单一 byte-range (RFC 7233 §2.1, §3.1).
+    /// </summary>
+    /// <param name="ARangeHeader">
+    ///   原始 Range 头, 如 "bytes=0-499" / "bytes=500-" / "bytes=-200".
+    /// </param>
+    /// <param name="AContentLength">
+    ///   资源完整长度, 必须 > 0.
+    /// </param>
+    /// <param name="AStart">
+    ///   解析成功时, 输出区间起点 (含, 0-based).
+    /// </param>
+    /// <param name="AEnd">
+    ///   解析成功时, 输出区间终点 (含, 0-based, &lt; AContentLength).
+    /// </param>
+    /// <returns>
+    ///   True: 区间合法且可满足, AStart/AEnd 已正确设置.
+    ///   False: 缺前缀 / 多 range / 非法数字 / 不可满足 (start &gt; end / start &gt;= size /
+    ///   suffix=0). 调用方应返回 416 + "Content-Range: bytes */size".
+    /// </returns>
+    /// <remarks>
+    ///   不支持 multipart/byteranges (含 ',' 一律拒绝), 与 Nginx/Apache 在小文件上的常见策略一致.
+    /// </remarks>
+    class function ParseSingleByteRange(const ARangeHeader: string;
+      const AContentLength: Int64; out AStart, AEnd: Int64): Boolean; static;
+
+    /// <summary>
+    ///   校验 HTTP header field-value 是否安全, 不允许出现 CR/LF (RFC 7230 §3.2.4).
+    /// </summary>
+    /// <remarks>
+    ///   主要用于防御响应拆分 (HTTP Response Splitting) 攻击: 若业务把含 CR/LF 的用户输入
+    ///   写入响应 header, 可能被攻击者注入伪造响应行或 header.
+    /// </remarks>
+    class function IsValidHeaderValue(const AValue: string): Boolean; static;
+
+    /// <summary>
+    ///   校验 HTTP header field-name 是否符合 RFC 7230 token 字符集.
+    /// </summary>
+    class function IsValidHeaderName(const AName: string): Boolean; static;
+
+    /// <summary>
+    ///   单字符版本: 判断字符是否属于 RFC 7230 §3.2.6 token 字符集.
+    /// </summary>
+    /// <remarks>
+    ///   token = ALPHA / DIGIT / "!" "#" "$" "%" "&amp;" "'" "*" "+" "-" "." "^" "_" "`" "|" "~"
+    ///   提供给逐字节扫描场景 (如 THttpHeader.Decode 单趟状态机) 复用规则, 避免重复定义.
+    /// </remarks>
+    class function IsTokenChar(ACh: Char): Boolean; static; inline;
+
+    /// <summary>
+    ///   单字符版本: 判断字符是否是合法的 HTTP header field-value 字符.
+    /// </summary>
+    /// <remarks>
+    ///   合法: HTAB(#9) / 可见 ASCII ($20..$7E) / $80+ 高位字符 (历史宽松, 兼容 UTF-8).
+    ///   非法: NUL/CR/LF 等其他 CTL ($00..$08, $0A..$1F) 与 DEL ($7F).
+    ///   提供给逐字节扫描场景复用规则, 避免重复定义.
+    /// </remarks>
+    class function IsHeaderValueChar(ACh: Char): Boolean; static; inline;
   end;
 
 implementation
@@ -1701,85 +1781,99 @@ end;
 
 class function TCrossHttpUtils.UrlDecode(const S: string): string;
 var
-  I, LStrLen: Integer;
-  LUTF8Bytes: TBytes;
-  P, PEnd: PChar;
+  LSrcBytes, LDstBytes: TBytes;
+  LSrcLen, LSrcIdx, LDstIdx: Integer;
   H, L: Byte;
+  C: Byte;
 begin
   if (S = '') then Exit('');
 
-  I := 0;
-  LStrLen := Length(S);
-  P := PChar(S);
-  PEnd := P + LStrLen;
-  SetLength(LUTF8Bytes, LStrLen);
+  // 先把输入 unicode 字符串 UTF-8 编码为字节流, 与 UrlEncode 对称.
+  // 这样允许输入混合: ASCII percent-encoded ('%E4%B8%AD') 与 unicode 原字符 ('中') 都能正确处理.
+  LSrcBytes := TEncoding.UTF8.GetBytes(S);
+  LSrcLen := Length(LSrcBytes);
+  SetLength(LDstBytes, LSrcLen);
 
-  while (P < PEnd) do
+  LSrcIdx := 0;
+  LDstIdx := 0;
+  while (LSrcIdx < LSrcLen) do
   begin
-    case Ord(P^) of
-      // 兼容早期的编码
+    C := LSrcBytes[LSrcIdx];
+    case C of
+      // 兼容早期 form-urlencoded: '+' → 空格
       Ord('+'):
         begin
-          LUTF8Bytes[I] := Ord(' ');
-          Inc(P);
+          LDstBytes[LDstIdx] := Ord(' ');
+          Inc(LSrcIdx);
         end;
 
       Ord('%'):
         begin
-          if (P + 2 < PEnd) then
+          if (LSrcIdx + 2 < LSrcLen)
+            and TUtils.HexCharToByte(Char(LSrcBytes[LSrcIdx + 1]), H)
+            and TUtils.HexCharToByte(Char(LSrcBytes[LSrcIdx + 2]), L) then
           begin
-            Inc(P);
-            if not TUtils.HexCharToByte(P^, H) then Break;
-            Inc(P);
-            if not TUtils.HexCharToByte(P^, L) then Break;
-            Inc(P);
-
-            LUTF8Bytes[I] := L + (H shl 4);
+            LDstBytes[LDstIdx] := L + (H shl 4);
+            Inc(LSrcIdx, 3);
           end else
           begin
-            LUTF8Bytes[I] := Ord('?');
-            Inc(P);
+            // 非法 %xx, 原样保留 '%' 字符
+            LDstBytes[LDstIdx] := Ord('%');
+            Inc(LSrcIdx);
           end;
         end;
     else
-      if (Ord(P^) < 128) then
-        LUTF8Bytes[I] := Ord(P^)
-      else
-        LUTF8Bytes[I] := Ord('?');
-
-      Inc(P);
+      // 包含 ASCII 与 UTF-8 多字节序列的高字节, 都原样透传
+      LDstBytes[LDstIdx] := C;
+      Inc(LSrcIdx);
     end;
 
-    Inc(I);
+    Inc(LDstIdx);
   end;
-  SetLength(LUTF8Bytes, I);
+  SetLength(LDstBytes, LDstIdx);
 
-  Result := TEncoding.UTF8.GetString(LUTF8Bytes);
+  Result := TEncoding.UTF8.GetString(LDstBytes);
 end;
 
-class function TCrossHttpUtils.UrlEncode(const S: string; const ANoConversion: TSysCharSet): string;
+class function TCrossHttpUtils.UrlEncode(const S: string; const ANoConversion: TSysCharSet;
+  const APreserveEncoded: Boolean): string;
 const
   HEX_CHARS: array[0..15] of Char = (
     '0', '1', '2', '3', '4', '5', '6', '7',
     '8', '9', 'A', 'B', 'C', 'D', 'E', 'F');
+
+  function _IsHexByte(const AByte: Byte): Boolean; inline;
+  begin
+    case AByte of
+      Ord('0')..Ord('9'),
+      Ord('a')..Ord('f'),
+      Ord('A')..Ord('F'):
+        Result := True;
+    else
+      Result := False;
+    end;
+  end;
+
 var
   LUTF8Bytes: TBytes;
-  I: Integer;
+  LLen, I: Integer;
   C: Byte;
   P: PChar;
 begin
   if (S = '') then Exit('');
-  
+
   // 先将 unicode 字符串编码为 utf8 字节数组
   LUTF8Bytes := TEncoding.UTF8.GetBytes(S);
+  LLen := Length(LUTF8Bytes);
 
   // 预分配编码字符串, 比一直累加效率高很多
   // 预分配尺寸为 utf8 字节数组长度的 3 倍
   // 之所以预分配 3 倍, 是因为每个 utf8 字节最长可能被编码为 %xy 这样的字符串
-  SetLength(Result, Length(LUTF8Bytes) * 3);
+  SetLength(Result, LLen * 3);
   P := PChar(Result);
 
-  for I := 0 to High(LUTF8Bytes) do
+  I := 0;
+  while (I < LLen) do
   begin
     C := LUTF8Bytes[I];
     case C of
@@ -1796,6 +1890,20 @@ begin
           Inc(P);
         end;
     else
+      // RFC 3986 §2.4: 已 percent-encoded 的 %xx 序列不应被二次编码.
+      // APreserveEncoded=True 时, 遇到 % 后跟 2 个 hex 数字, 原样保留 3 字符.
+      if APreserveEncoded and (C = Ord('%')) and (I + 2 < LLen)
+        and _IsHexByte(LUTF8Bytes[I + 1])
+        and _IsHexByte(LUTF8Bytes[I + 2]) then
+      begin
+        P^ := '%';
+        Inc(P);
+        P^ := Char(LUTF8Bytes[I + 1]);
+        Inc(P);
+        P^ := Char(LUTF8Bytes[I + 2]);
+        Inc(P);
+        Inc(I, 2); // 跳过两个 hex 字节, 循环底部还会 Inc(I) 一次
+      end else
       if CharInSet(Char(C), ANoConversion) then
       begin
         P^ := Char(C);
@@ -1812,10 +1920,163 @@ begin
         Inc(P);
       end;
     end;
+    Inc(I);
   end;
 
   // 修正编码字符串的实际长度
   SetLength(Result, P - PChar(Result));
+end;
+
+class function TCrossHttpUtils.ParseSingleByteRange(const ARangeHeader: string;
+  const AContentLength: Int64; out AStart, AEnd: Int64): Boolean;
+const
+  PREFIX = 'bytes=';
+
+  function _IsAsciiDigits(const S: string): Boolean;
+  var
+    I: Integer;
+  begin
+    if (S = '') then Exit(False);
+    for I := 1 to Length(S) do
+      case S[I] of
+        '0'..'9': ;
+      else
+        Exit(False);
+      end;
+    Result := True;
+  end;
+
+var
+  LSpec, LStartStr, LEndStr: string;
+  LDashPos: Integer;
+  LStartVal, LEndVal: Int64;
+  LHasStart, LHasEnd: Boolean;
+begin
+  AStart := 0;
+  AEnd := 0;
+  Result := False;
+
+  // 资源长度必须 > 0
+  if (AContentLength <= 0) then Exit;
+
+  // 必须以 'bytes=' 前缀开头 (RFC 7233 §3.1, 大小写不敏感)
+  if (Length(ARangeHeader) <= Length(PREFIX))
+    or not ARangeHeader.StartsWith(PREFIX, True) then Exit;
+
+  LSpec := Copy(ARangeHeader, Length(PREFIX) + 1, MaxInt).Trim;
+  if (LSpec = '') then Exit;
+
+  // 不支持 multipart/byteranges (含 ',' 一律拒绝)
+  if (LSpec.IndexOf(',') >= 0) then Exit;
+
+  // 必须存在且仅有一个 '-'
+  LDashPos := LSpec.IndexOf('-');
+  if (LDashPos < 0) then Exit;
+  if (LSpec.LastIndexOf('-') <> LDashPos) then Exit;
+
+  // 不对子串再 Trim, 避免 'bytes=0 - 100' 内嵌空格被静默吞掉.
+  // RFC 7230 ABNF 不允许 byte-range-spec 内含 OWS/BWS.
+  LStartStr := LSpec.Substring(0, LDashPos);
+  LEndStr := LSpec.Substring(LDashPos + 1);
+
+  LHasStart := (LStartStr <> '');
+  LHasEnd := (LEndStr <> '');
+
+  // 至少要有一个端点; 'bytes=-' 是非法的
+  if (not LHasStart) and (not LHasEnd) then Exit;
+
+  // 解析 start (必须为纯 ASCII 十进制数字)
+  if LHasStart then
+  begin
+    if not _IsAsciiDigits(LStartStr) then Exit;
+    if not TryStrToInt64(LStartStr, LStartVal) then Exit;
+    if (LStartVal < 0) then Exit;
+  end else
+    LStartVal := 0;
+
+  // 解析 end (必须为纯 ASCII 十进制数字)
+  if LHasEnd then
+  begin
+    if not _IsAsciiDigits(LEndStr) then Exit;
+    if not TryStrToInt64(LEndStr, LEndVal) then Exit;
+    if (LEndVal < 0) then Exit;
+  end else
+    LEndVal := 0;
+
+  if LHasStart and LHasEnd then
+  begin
+    // bytes=start-end: 要求 0 <= start <= end < size
+    if (LStartVal > LEndVal) then Exit;
+    if (LStartVal >= AContentLength) then Exit;
+    // end 超出文件大小时按 RFC 7233 §2.1 截断到 size-1
+    if (LEndVal >= AContentLength) then
+      LEndVal := AContentLength - 1;
+    AStart := LStartVal;
+    AEnd := LEndVal;
+  end else
+  if LHasStart then
+  begin
+    // bytes=start-: 从 start 取到末尾
+    if (LStartVal >= AContentLength) then Exit;
+    AStart := LStartVal;
+    AEnd := AContentLength - 1;
+  end else
+  begin
+    // bytes=-suffix: 取末尾 suffix 字节; suffix 必须 > 0
+    if (LEndVal = 0) then Exit;
+    if (LEndVal >= AContentLength) then
+      AStart := 0
+    else
+      AStart := AContentLength - LEndVal;
+    AEnd := AContentLength - 1;
+  end;
+
+  Result := True;
+end;
+
+class function TCrossHttpUtils.IsTokenChar(ACh: Char): Boolean;
+begin
+  // RFC 7230 §3.2.6 token: ALPHA / DIGIT / "!" "#" "$" "%" "&" "'" "*" "+"
+  //   "-" "." "^" "_" "`" "|" "~"
+  case ACh of
+    'A'..'Z', 'a'..'z', '0'..'9',
+    '!', '#', '$', '%', '&', '''', '*', '+', '-', '.', '^', '_', '`', '|', '~':
+      Result := True;
+  else
+    Result := False;
+  end;
+end;
+
+class function TCrossHttpUtils.IsHeaderValueChar(ACh: Char): Boolean;
+begin
+  // RFC 7230 §3.2.4 field-value:
+  //   合法: HTAB(#9) / 可见 ASCII (#32..#126) / #128+ 高位字符 (历史宽松, 兼容 UTF-8).
+  //   非法: 其他 CTL (#0..#8, #10..#31) 与 DEL (#127), CR/LF/NUL 是响应拆分主要载体.
+  case Ord(ACh) of
+    9, 32..126, 128..$FFFF:
+      Result := True;
+  else
+    Result := False;
+  end;
+end;
+
+class function TCrossHttpUtils.IsValidHeaderName(const AName: string): Boolean;
+var
+  I: Integer;
+begin
+  if (AName = '') then Exit(False);
+  for I := 1 to Length(AName) do
+    if not IsTokenChar(AName[I]) then Exit(False);
+  Result := True;
+end;
+
+class function TCrossHttpUtils.IsValidHeaderValue(const AValue: string): Boolean;
+var
+  I: Integer;
+begin
+  for I := 1 to Length(AValue) do
+    if not IsHeaderValueChar(AValue[I]) then Exit(False);
+  Result := True;
 end;
 
 end.

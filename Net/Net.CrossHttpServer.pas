@@ -66,10 +66,12 @@ type
   ICrossHttpServer = interface;
   ICrossHttpRequest = interface;
   ICrossHttpResponse = interface;
+  IHttpResponseQueueItem = interface;
 
   TCrossHttpServer = class;
   TCrossHttpRequest = class;
   TCrossHttpResponse = class;
+  THttpResponseQueueItem = class;
 
   /// <summary>
   ///   HTTP连接接口
@@ -474,6 +476,79 @@ type
   ///   提供块数据的匿名函数
   /// </summary>
   TCrossHttpChunkDataFunc = reference to function(const AData: PPointer; const ACount: PNativeInt): Boolean;
+
+  /// <summary>
+  ///   HTTP响应队列项接口
+  ///   用于按请求解析顺序串行化每个连接上的响应发送, 避免 pipelining 响应交错
+  /// </summary>
+  IHttpResponseQueueItem = interface
+  ['{B03F35B7-6984-41A8-9AA0-6B3D48F18F91}']
+    function GetRequest: ICrossHttpRequest;
+    function GetResponse: ICrossHttpResponse;
+    function GetSource: TCrossHttpChunkDataFunc;
+    function GetCallback: TCrossConnectionCallback;
+    function GetReady: Boolean;
+    function GetSending: Boolean;
+    function GetCompleted: Boolean;
+    function GetKeepAlive: Boolean;
+    function GetStatusCode: Integer;
+
+    procedure SetRequest(const AValue: ICrossHttpRequest);
+    procedure SetResponse(const AValue: ICrossHttpResponse);
+    procedure SetSource(const AValue: TCrossHttpChunkDataFunc);
+    procedure SetCallback(const AValue: TCrossConnectionCallback);
+    procedure SetReady(const AValue: Boolean);
+    procedure SetSending(const AValue: Boolean);
+    procedure SetCompleted(const AValue: Boolean);
+    procedure SetKeepAlive(const AValue: Boolean);
+    procedure SetStatusCode(const AValue: Integer);
+
+    property Request: ICrossHttpRequest read GetRequest write SetRequest;
+    property Response: ICrossHttpResponse read GetResponse write SetResponse;
+    property Source: TCrossHttpChunkDataFunc read GetSource write SetSource;
+    property Callback: TCrossConnectionCallback read GetCallback write SetCallback;
+    property Ready: Boolean read GetReady write SetReady;
+    property Sending: Boolean read GetSending write SetSending;
+    property Completed: Boolean read GetCompleted write SetCompleted;
+    property KeepAlive: Boolean read GetKeepAlive write SetKeepAlive;
+    property StatusCode: Integer read GetStatusCode write SetStatusCode;
+  end;
+
+  /// <summary>
+  ///   HTTP响应队列项实现类
+  /// </summary>
+  THttpResponseQueueItem = class(TInterfacedObject, IHttpResponseQueueItem)
+  private
+    FRequest: ICrossHttpRequest;
+    FResponse: ICrossHttpResponse;
+    FSource: TCrossHttpChunkDataFunc;
+    FCallback: TCrossConnectionCallback;
+    FReady: Boolean;
+    FSending: Boolean;
+    FCompleted: Boolean;
+    FKeepAlive: Boolean;
+    FStatusCode: Integer;
+  protected
+    function GetRequest: ICrossHttpRequest;
+    function GetResponse: ICrossHttpResponse;
+    function GetSource: TCrossHttpChunkDataFunc;
+    function GetCallback: TCrossConnectionCallback;
+    function GetReady: Boolean;
+    function GetSending: Boolean;
+    function GetCompleted: Boolean;
+    function GetKeepAlive: Boolean;
+    function GetStatusCode: Integer;
+
+    procedure SetRequest(const AValue: ICrossHttpRequest);
+    procedure SetResponse(const AValue: ICrossHttpResponse);
+    procedure SetSource(const AValue: TCrossHttpChunkDataFunc);
+    procedure SetCallback(const AValue: TCrossConnectionCallback);
+    procedure SetReady(const AValue: Boolean);
+    procedure SetSending(const AValue: Boolean);
+    procedure SetCompleted(const AValue: Boolean);
+    procedure SetKeepAlive(const AValue: Boolean);
+    procedure SetStatusCode(const AValue: Integer);
+  end;
 
   /// <summary>
   ///   HTTP应答接口
@@ -958,12 +1033,23 @@ type
   TCrossHttpRouterMethod = procedure(const ARequest: ICrossHttpRequest; const AResponse: ICrossHttpResponse; var AHandled: Boolean) of object;
 
   TCrossHttpConnEvent = procedure(const Sender: TObject; const AConnection: ICrossHttpConnection) of object;
-  TCrossHttpRequestEvent = procedure(const Sender: TObject; const ARequest: ICrossHttpRequest; const AResponse: ICrossHttpResponse; var AHandled: Boolean) of object;
   TCrossHttpRequestExceptionEvent = procedure(const Sender: TObject; const ARequest: ICrossHttpRequest; const AResponse: ICrossHttpResponse; const AException: Exception) of object;
-  TCrossHttpDataEvent = procedure(const Sender: TObject; const AClient: ICrossHttpConnection; const ABuf: Pointer; const ALen: Integer) of object;
 
-  TCrossHttpBeforeRequestEvent = TCrossHttpConnEvent;
-  TCrossHttpAfterRequestEvent = procedure(const Sender: TObject; const AConnection: ICrossHttpConnection; const ASuccess: Boolean) of object;
+  TCrossHttpRequestEvent = procedure(const Sender: TObject;
+    const AConnection: ICrossHttpConnection;
+    const ARequest: ICrossHttpRequest; const AResponse: ICrossHttpResponse;
+    var AHandled: Boolean) of object;
+
+  // Begin/End 事件签名带上 ARequest/AResponse, 让事件 handler 能拿到本次事件
+  // 对应的请求/响应对象, 不再依赖连接级 FRequest/FResponse 兼容视图
+  // (该兼容视图在 pipelining 下语义模糊, 已不再由 _FinishQueueItem 维护)
+  TCrossHttpRequestBeginEvent = procedure(const Sender: TObject;
+    const AConnection: ICrossHttpConnection;
+    const ARequest: ICrossHttpRequest; const AResponse: ICrossHttpResponse) of object;
+  TCrossHttpRequestEndEvent = procedure(const Sender: TObject;
+    const AConnection: ICrossHttpConnection;
+    const ARequest: ICrossHttpRequest; const AResponse: ICrossHttpResponse;
+    const ASuccess: Boolean) of object;
 
   /// <summary>
   ///   <para>
@@ -1041,26 +1127,28 @@ type
     function GetAutoDeleteFiles: Boolean;
     function GetMaxHeaderSize: Int64;
     function GetMaxPostDataSize: Int64;
+    function GetMaxCompressRatio: Integer;
     function GetCompressible: Boolean;
     function GetMinCompressSize: Int64;
     function GetSessions: ISessions;
     function GetSessionIDCookieName: string;
-    function GetOnRequestBegin: TCrossHttpBeforeRequestEvent;
+    function GetOnRequestBegin: TCrossHttpRequestBeginEvent;
     function GetOnRequest: TCrossHttpRequestEvent;
-    function GetOnRequestEnd: TCrossHttpAfterRequestEvent;
+    function GetOnRequestEnd: TCrossHttpRequestEndEvent;
     function GetOnRequestException: TCrossHttpRequestExceptionEvent;
 
     procedure SetStoragePath(const Value: string);
     procedure SetAutoDeleteFiles(const Value: Boolean);
     procedure SetMaxHeaderSize(const Value: Int64);
     procedure SetMaxPostDataSize(const Value: Int64);
+    procedure SetMaxCompressRatio(const Value: Integer);
     procedure SetCompressible(const Value: Boolean);
     procedure SetMinCompressSize(const Value: Int64);
     procedure SetSessions(const Value: ISessions);
     procedure SetSessionIDCookieName(const Value: string);
-    procedure SetOnRequestBegin(const Value: TCrossHttpBeforeRequestEvent);
+    procedure SetOnRequestBegin(const Value: TCrossHttpRequestBeginEvent);
     procedure SetOnRequest(const Value: TCrossHttpRequestEvent);
-    procedure SetOnRequestEnd(const Value: TCrossHttpAfterRequestEvent);
+    procedure SetOnRequestEnd(const Value: TCrossHttpRequestEndEvent);
     procedure SetOnRequestException(const Value: TCrossHttpRequestExceptionEvent);
 
     /// <summary>
@@ -1575,6 +1663,23 @@ type
     property MaxPostDataSize: Int64 read GetMaxPostDataSize write SetMaxPostDataSize;
 
     /// <summary>
+    ///   gzip/deflate 解压时的最大压缩比 (DecodedSize / EncodedSize)
+    ///   <list type="bullet">
+    ///     <item>
+    ///       &gt; 0, 解压输出与输入比超过该值则按 zip bomb 拒绝 (400)
+    ///     </item>
+    ///     <item>
+    ///       = 0, 不做压缩比检查 (仅靠 MaxPostDataSize 拦截)
+    ///     </item>
+    ///   </list>
+    /// </summary>
+    /// <remarks>
+    ///   合法 gzip 通常 1.5-15:1, 极规整数据 (StringOfChar, 大块重复字节) 可达 100-500:1
+    ///   经典 zip bomb 1000:1 起 (42.zip ~100000:1), 默认 1000:1 兜底拦截 bomb
+    /// </remarks>
+    property MaxCompressRatio: Integer read GetMaxCompressRatio write SetMaxCompressRatio;
+
+    /// <summary>
     ///   是否开启压缩
     /// </summary>
     /// <remarks>
@@ -1621,9 +1726,9 @@ type
     /// </remarks>
     property SessionIDCookieName: string read GetSessionIDCookieName write SetSessionIDCookieName;
 
-    property OnRequestBegin: TCrossHttpBeforeRequestEvent read GetOnRequestBegin write SetOnRequestBegin;
+    property OnRequestBegin: TCrossHttpRequestBeginEvent read GetOnRequestBegin write SetOnRequestBegin;
     property OnRequest: TCrossHttpRequestEvent read GetOnRequest write SetOnRequest;
-    property OnRequestEnd: TCrossHttpAfterRequestEvent read GetOnRequestEnd write SetOnRequestEnd;
+    property OnRequestEnd: TCrossHttpRequestEndEvent read GetOnRequestEnd write SetOnRequestEnd;
     property OnRequestException: TCrossHttpRequestExceptionEvent read GetOnRequestException write SetOnRequestException;
   end;
 
@@ -1637,6 +1742,12 @@ type
     FHttpParser: ICrossHttpParser;
     FPending: Integer;
 
+    // pipelining 响应队列, 按请求解析顺序串行化响应发送
+    FResponseQueue: TList<IHttpResponseQueueItem>;
+    FResponseQueueLock: ILock;
+    FSendingResponse: Boolean;
+    FParsingItem: IHttpResponseQueueItem;
+
     {$region 'HttpParser事件'}
     // 以下事件都在 FHttpParser.Decode 中被触发
     // 而 FHttpParser.Decode 在 ParseRecvData 中被调用
@@ -1644,7 +1755,7 @@ type
     // FServer.LogicReceived 被 TCrossConnectionBase._LockRecv 保护
     // 所以无需担心以下事件的多线程安全问题
     procedure _OnHeaderData(const ADataPtr: Pointer; const ADataSize: Integer);
-    function _OnGetHeaderValue(const AHeaderName: string; out AHeaderValue: string): Boolean;
+    function _OnGetHeaderValue(const AHeaderName: string; out AHeaderValues: TArray<string>): Boolean;
     procedure _OnBodyBegin;
     procedure _OnBodyData(const ADataPtr: Pointer; const ADataSize: Integer);
     procedure _OnBodyEnd;
@@ -1653,8 +1764,21 @@ type
     procedure _OnParseFailed(const ACode: Integer; const AError: string);
     {$endregion}
 
-    // 发送完响应数据后触发
-    procedure _DoOnRequestEnd(const ASuccess: Boolean);
+    // 响应队列内部方法
+    procedure _QueueResponseReady(const AItem: IHttpResponseQueueItem;
+      const ASource: TCrossHttpChunkDataFunc;
+      const ACallback: TCrossConnectionCallback);
+    procedure _SendQueueItem(const AItem: IHttpResponseQueueItem);
+    procedure _FinishQueueItem(const AItem: IHttpResponseQueueItem; const ASuccess: Boolean);
+
+    // 调用前必须已持有 FResponseQueueLock; 若可发送则取出队首 ready item
+    // 并设置 FSendingResponse / item.Sending, 否则返回 nil
+    function _TryDequeueReadyLocked: IHttpResponseQueueItem;
+
+    // 调用前必须已持有 FResponseQueueLock; 清空队列, 同时主动断开每个 item
+    // 内对 request/response/source/callback 的接口引用, 避免与 response.FQueueItem
+    // 等形成的循环引用导致 item 永不释放
+    procedure _ClearResponseQueueLocked;
   protected
     function GetRequest: ICrossHttpRequest;
     function GetResponse: ICrossHttpResponse;
@@ -1664,6 +1788,10 @@ type
 
     procedure ReleaseRequest; virtual;
     procedure ReleaseResponse; virtual;
+
+    // socket 关闭时主动打破 connection 与 request/response 之间的循环引用,
+    // 并清空响应队列, 避免连接关闭后 connection 因循环引用永不释放导致内存泄漏
+    procedure InternalClose; override;
   public
     constructor Create(const AOwner: TCrossSocketBase; const AClientSocket: TSocket;
       const AConnectType: TConnectType; const AHost: string;
@@ -1821,6 +1949,7 @@ type
     FHeader: THttpHeader;
     FCookies: TResponseCookies;
     FSendStatus: Integer;
+    FQueueItem: IHttpResponseQueueItem;
 
     procedure Reset;
     function _CreateHeader(const ABodySize: Int64; AChunked: Boolean): TBytes;
@@ -1890,7 +2019,10 @@ type
     procedure SetStatusCode(Value: Integer);
     procedure SetStatusText(const Value: string);
   public
-    constructor Create(const AConnection: TCrossHttpConnection);
+    constructor Create(const AConnection: TCrossHttpConnection); overload;
+    constructor Create(const AConnection: TCrossHttpConnection;
+      const ARequest: ICrossHttpRequest;
+      const AQueueItem: IHttpResponseQueueItem); overload;
     destructor Destroy; override;
   end;
 
@@ -2069,6 +2201,7 @@ type
     FAutoDeleteFiles: Boolean;
     FMaxPostDataSize: Int64;
     FMaxHeaderSize: Int64;
+    FMaxCompressRatio: Integer;
     FMinCompressSize: Integer;
     FSessionIDCookieName: string;
 
@@ -2076,8 +2209,8 @@ type
     FMiddlewares: TCrossHttpRouterTree;
 
     FSessions: ISessions;
-    FOnRequestBegin: TCrossHttpBeforeRequestEvent;
-    FOnRequestEnd: TCrossHttpAfterRequestEvent;
+    FOnRequestBegin: TCrossHttpRequestBeginEvent;
+    FOnRequestEnd: TCrossHttpRequestEndEvent;
     FOnRequest: TCrossHttpRequestEvent;
     FOnRequestException: TCrossHttpRequestExceptionEvent;
     FCompressible: Boolean;
@@ -2086,26 +2219,28 @@ type
     function GetAutoDeleteFiles: Boolean;
     function GetMaxHeaderSize: Int64;
     function GetMaxPostDataSize: Int64;
+    function GetMaxCompressRatio: Integer;
     function GetCompressible: Boolean;
     function GetMinCompressSize: Int64;
     function GetSessions: ISessions;
     function GetSessionIDCookieName: string;
     function GetOnRequest: TCrossHttpRequestEvent;
-    function GetOnRequestEnd: TCrossHttpAfterRequestEvent;
-    function GetOnRequestBegin: TCrossHttpBeforeRequestEvent;
+    function GetOnRequestEnd: TCrossHttpRequestEndEvent;
+    function GetOnRequestBegin: TCrossHttpRequestBeginEvent;
     function GetOnRequestException: TCrossHttpRequestExceptionEvent;
 
     procedure SetStoragePath(const Value: string);
     procedure SetAutoDeleteFiles(const Value: Boolean);
     procedure SetMaxHeaderSize(const Value: Int64);
     procedure SetMaxPostDataSize(const Value: Int64);
+    procedure SetMaxCompressRatio(const Value: Integer);
     procedure SetCompressible(const Value: Boolean);
     procedure SetMinCompressSize(const Value: Int64);
     procedure SetSessions(const Value: ISessions);
     procedure SetSessionIDCookieName(const Value: string);
     procedure SetOnRequest(const Value: TCrossHttpRequestEvent);
-    procedure SetOnRequestBegin(const Value: TCrossHttpBeforeRequestEvent);
-    procedure SetOnRequestEnd(const Value: TCrossHttpAfterRequestEvent);
+    procedure SetOnRequestBegin(const Value: TCrossHttpRequestBeginEvent);
+    procedure SetOnRequestEnd(const Value: TCrossHttpRequestEndEvent);
     procedure SetOnRequestException(const Value: TCrossHttpRequestExceptionEvent);
   protected
     function CreateConnection(const AOwner: TCrossSocketBase; const AClientSocket: TSocket;
@@ -2115,13 +2250,18 @@ type
     procedure LogicReceived(const AConnection: ICrossConnection; const ABuf: Pointer; const ALen: Integer); override;
   protected
     // 处理请求前
-    procedure DoOnRequestBegin(const AConnection: ICrossHttpConnection); virtual;
+    // 显式传入 ARequest/AResponse, 避免在 pipelining 场景下从 connection 字段读取产生 race
+    procedure DoOnRequestBegin(const AConnection: ICrossHttpConnection;
+      const ARequest: ICrossHttpRequest; const AResponse: ICrossHttpResponse); virtual;
 
     // 处理请求
-    procedure DoOnRequest(const AConnection: ICrossHttpConnection); virtual;
+    procedure DoOnRequest(const AConnection: ICrossHttpConnection;
+      const ARequest: ICrossHttpRequest; const AResponse: ICrossHttpResponse); virtual;
 
     // 处理请求后
-    procedure DoOnRequestEnd(const AConnection: ICrossHttpConnection; const ASuccess: Boolean); virtual;
+    procedure DoOnRequestEnd(const AConnection: ICrossHttpConnection;
+      const ARequest: ICrossHttpRequest; const AResponse: ICrossHttpResponse;
+      const ASuccess: Boolean); virtual;
   public
     constructor Create(const AIoThreads: Integer; const ASsl: Boolean); override;
     destructor Destroy; override;
@@ -2169,14 +2309,15 @@ type
     property AutoDeleteFiles: Boolean read GetAutoDeleteFiles write SetAutoDeleteFiles;
     property MaxHeaderSize: Int64 read GetMaxHeaderSize write SetMaxHeaderSize;
     property MaxPostDataSize: Int64 read GetMaxPostDataSize write SetMaxPostDataSize;
+    property MaxCompressRatio: Integer read GetMaxCompressRatio write SetMaxCompressRatio;
     property Compressible: Boolean read GetCompressible write SetCompressible;
     property MinCompressSize: Int64 read GetMinCompressSize write SetMinCompressSize;
     property Sessions: ISessions read GetSessions write SetSessions;
     property SessionIDCookieName: string read GetSessionIDCookieName write SetSessionIDCookieName;
 
-    property OnRequestBegin: TCrossHttpBeforeRequestEvent read GetOnRequestBegin write SetOnRequestBegin;
+    property OnRequestBegin: TCrossHttpRequestBeginEvent read GetOnRequestBegin write SetOnRequestBegin;
     property OnRequest: TCrossHttpRequestEvent read GetOnRequest write SetOnRequest;
-    property OnRequestEnd: TCrossHttpAfterRequestEvent read GetOnRequestEnd write SetOnRequestEnd;
+    property OnRequestEnd: TCrossHttpRequestEndEvent read GetOnRequestEnd write SetOnRequestEnd;
     property OnRequestException: TCrossHttpRequestExceptionEvent read GetOnRequestException write SetOnRequestException;
   end;
 
@@ -2206,6 +2347,98 @@ begin
   FStatusCode := AStatusCode;
 end;
 
+{ THttpResponseQueueItem }
+
+function THttpResponseQueueItem.GetRequest: ICrossHttpRequest;
+begin
+  Result := FRequest;
+end;
+
+function THttpResponseQueueItem.GetResponse: ICrossHttpResponse;
+begin
+  Result := FResponse;
+end;
+
+function THttpResponseQueueItem.GetSource: TCrossHttpChunkDataFunc;
+begin
+  Result := FSource;
+end;
+
+function THttpResponseQueueItem.GetCallback: TCrossConnectionCallback;
+begin
+  Result := FCallback;
+end;
+
+function THttpResponseQueueItem.GetReady: Boolean;
+begin
+  Result := FReady;
+end;
+
+function THttpResponseQueueItem.GetSending: Boolean;
+begin
+  Result := FSending;
+end;
+
+function THttpResponseQueueItem.GetCompleted: Boolean;
+begin
+  Result := FCompleted;
+end;
+
+function THttpResponseQueueItem.GetKeepAlive: Boolean;
+begin
+  Result := FKeepAlive;
+end;
+
+function THttpResponseQueueItem.GetStatusCode: Integer;
+begin
+  Result := FStatusCode;
+end;
+
+procedure THttpResponseQueueItem.SetRequest(const AValue: ICrossHttpRequest);
+begin
+  FRequest := AValue;
+end;
+
+procedure THttpResponseQueueItem.SetResponse(const AValue: ICrossHttpResponse);
+begin
+  FResponse := AValue;
+end;
+
+procedure THttpResponseQueueItem.SetSource(const AValue: TCrossHttpChunkDataFunc);
+begin
+  FSource := AValue;
+end;
+
+procedure THttpResponseQueueItem.SetCallback(const AValue: TCrossConnectionCallback);
+begin
+  FCallback := AValue;
+end;
+
+procedure THttpResponseQueueItem.SetReady(const AValue: Boolean);
+begin
+  FReady := AValue;
+end;
+
+procedure THttpResponseQueueItem.SetSending(const AValue: Boolean);
+begin
+  FSending := AValue;
+end;
+
+procedure THttpResponseQueueItem.SetCompleted(const AValue: Boolean);
+begin
+  FCompleted := AValue;
+end;
+
+procedure THttpResponseQueueItem.SetKeepAlive(const AValue: Boolean);
+begin
+  FKeepAlive := AValue;
+end;
+
+procedure THttpResponseQueueItem.SetStatusCode(const AValue: Integer);
+begin
+  FStatusCode := AValue;
+end;
+
 { TCrossHttpConnection }
 
 constructor TCrossHttpConnection.Create(const AOwner: TCrossSocketBase;
@@ -2216,9 +2449,13 @@ begin
 
   FServer := AOwner as TCrossHttpServer;
 
+  FResponseQueue := TList<IHttpResponseQueueItem>.Create;
+  FResponseQueueLock := TLock.Create;
+
   FHttpParser := TCrossHttpParser.Create(pmServer);
   FHttpParser.MaxHeaderSize := FServer.MaxHeaderSize;
   FHttpParser.MaxBodyDataSize := FServer.MaxPostDataSize;
+  FHttpParser.MaxCompressRatio := FServer.MaxCompressRatio;
   FHttpParser.OnHeaderData := _OnHeaderData;
   FHttpParser.OnGetHeaderValue := _OnGetHeaderValue;
   FHttpParser.OnBodyBegin := _OnBodyBegin;
@@ -2239,6 +2476,10 @@ begin
 
   ReleaseRequest;
   ReleaseResponse;
+
+  FParsingItem := nil;
+  FreeAndNil(FResponseQueue);
+  FResponseQueueLock := nil;
 
   FHttpParser := nil;
 
@@ -2281,23 +2522,239 @@ begin
   FResponse := nil;
 end;
 
-procedure TCrossHttpConnection._DoOnRequestEnd(const ASuccess: Boolean);
+procedure TCrossHttpConnection.InternalClose;
 begin
-  _LockRecv;
-  try
-    Dec(FPending);
+  // 必须在 socket 关闭时主动断开连接级 FRequest/FResponse 与 request.FConnection /
+  // response.FConnection 之间的循环引用. 否则 connection.FRequest 持有 request, 而
+  // request.FConnection 又持有 connection, refcount 永不归零, 不仅 connection 不会
+  // 销毁, 队列内 item / request body / response header 等也全部泄漏.
+  if (FRequest <> nil) then
+    (FRequest as TCrossHttpRequest).FConnection := nil;
+  if (FResponse <> nil) then
+    (FResponse as TCrossHttpResponse).FConnection := nil;
+  ReleaseRequest;
+  ReleaseResponse;
 
-    FServer.DoOnRequestEnd(Self, ASuccess);
+  // 清空响应队列中剩余 items: 它们持有的 request/response/source/callback 接口字段
+  // 与 response.FQueueItem 形成循环引用. 必须先逐个清空 item 内的接口字段,
+  // 再 Clear 队列, 否则 items 引用计数减 1 之后仍因循环引用而不会归零, 导致泄漏
+  FParsingItem := nil;
+  if (FResponseQueueLock <> nil) and (FResponseQueue <> nil) then
+  begin
+    FResponseQueueLock.Enter;
+    try
+      _ClearResponseQueueLocked;
+    finally
+      FResponseQueueLock.Leave;
+    end;
+  end;
 
-    // 请求结束之后释放请求和响应对象
-    if (FPending = 0) then
+  inherited InternalClose;
+end;
+
+function TCrossHttpConnection._TryDequeueReadyLocked: IHttpResponseQueueItem;
+begin
+  Result := nil;
+
+  if FSendingResponse then Exit;
+  if (FResponseQueue = nil) or (FResponseQueue.Count = 0) then Exit;
+  if not FResponseQueue[0].Ready then Exit;
+
+  // 从队列中移除队首, 由调用方的局部接口引用保活后续发送过程
+  Result := FResponseQueue[0];
+  FResponseQueue.Delete(0);
+  FSendingResponse := True;
+  Result.Sending := True;
+end;
+
+procedure TCrossHttpConnection._ClearResponseQueueLocked;
+var
+  I: Integer;
+  LItem: IHttpResponseQueueItem;
+begin
+  if (FResponseQueue = nil) then Exit;
+
+  for I := 0 to FResponseQueue.Count - 1 do
+  begin
+    LItem := FResponseQueue[I];
+    if (LItem <> nil) then
     begin
-      ReleaseRequest;
-      ReleaseResponse;
+      LItem.Request := nil;
+      LItem.Response := nil;
+      LItem.Source := nil;
+      LItem.Callback := nil;
+    end;
+  end;
+
+  FResponseQueue.Clear;
+end;
+
+procedure TCrossHttpConnection._QueueResponseReady(
+  const AItem: IHttpResponseQueueItem;
+  const ASource: TCrossHttpChunkDataFunc;
+  const ACallback: TCrossConnectionCallback);
+var
+  LAlreadyReadyOrCompleted: Boolean;
+  LItemToSend: IHttpResponseQueueItem;
+begin
+  if (AItem = nil) then
+  begin
+    if Assigned(ACallback) then
+      ACallback(Self, False);
+    Exit;
+  end;
+
+  LAlreadyReadyOrCompleted := False;
+  LItemToSend := nil;
+
+  // 单次锁块完成 "标记 ready" 与 "尝试 take 队首" 两件事
+  // 减少 happy path 上的锁/解锁次数, 降低高并发竞争开销
+  FResponseQueueLock.Enter;
+  try
+    if AItem.Ready or AItem.Completed then
+    begin
+      // 同一个 item 不允许重复 ready, 不修改原有 Source/Callback
+      LAlreadyReadyOrCompleted := True;
+    end else
+    begin
+      AItem.Source := ASource;
+      AItem.Callback := ACallback;
+      AItem.KeepAlive := AItem.Request.KeepAlive;
+      AItem.StatusCode := AItem.Response.StatusCode;
+      AItem.Ready := True;
+
+      // 没有正在发送时, 立即尝试取队首 ready item
+      LItemToSend := _TryDequeueReadyLocked;
     end;
   finally
-    _UnlockRecv;
+    FResponseQueueLock.Leave;
   end;
+
+  if LAlreadyReadyOrCompleted then
+  begin
+    // 安全降级: 对重复传入的 callback 触发失败, 避免调用方静默挂起
+    if Assigned(ACallback) then
+      ACallback(Self, False);
+    Exit;
+  end;
+
+  if (LItemToSend <> nil) then
+    _SendQueueItem(LItemToSend);
+end;
+
+procedure TCrossHttpConnection._SendQueueItem(const AItem: IHttpResponseQueueItem);
+var
+  LConnection: ICrossHttpConnection;
+  LSender: TCrossConnectionCallback;
+begin
+  LConnection := Self;
+
+  LSender :=
+    procedure(const AConnection: ICrossConnection; const ASuccess: Boolean)
+    var
+      LData: Pointer;
+      LCount: NativeInt;
+      LSource: TCrossHttpChunkDataFunc;
+    begin
+      if not ASuccess then
+      begin
+        _FinishQueueItem(AItem, False);
+        LConnection := nil;
+        LSender := nil;
+        Exit;
+      end;
+
+      LSource := AItem.Source;
+      LData := nil;
+      LCount := 0;
+      if not Assigned(LSource)
+        or not LSource(@LData, @LCount)
+        or (LData = nil)
+        or (LCount <= 0) then
+      begin
+        _FinishQueueItem(AItem, True);
+        LConnection := nil;
+        LSender := nil;
+        Exit;
+      end;
+
+      AConnection.SendBuf(LData^, LCount, LSender);
+    end;
+
+  LSender(LConnection, True);
+end;
+
+procedure TCrossHttpConnection._FinishQueueItem(
+  const AItem: IHttpResponseQueueItem; const ASuccess: Boolean);
+var
+  LRequest: ICrossHttpRequest;
+  LResponse: ICrossHttpResponse;
+  LCallback: TCrossConnectionCallback;
+  LNeedDisconnect, LDoEnd: Boolean;
+  LItemNext: IHttpResponseQueueItem;
+begin
+  LDoEnd := False;
+  LNeedDisconnect := False;
+  LRequest := nil;
+  LResponse := nil;
+  LCallback := nil;
+  LItemNext := nil;
+
+  // 单次锁块完成 "标记 completed + 释放 sending 标志 + 尝试 take 下一个 ready item"
+  // 三件事, 锁外再触发下一个 item 的发送, 避免两次进出锁的开销
+  FResponseQueueLock.Enter;
+  try
+    if not AItem.Completed then
+    begin
+      LRequest := AItem.Request;
+      LResponse := AItem.Response;
+      LCallback := AItem.Callback;
+      LNeedDisconnect := ASuccess and ((not AItem.KeepAlive) or (AItem.StatusCode >= 400));
+
+      AItem.Completed := True;
+      FSendingResponse := False;
+      LDoEnd := True;
+
+      // 关键: 立即清空 item 对外部对象的接口引用, 打破循环引用导致的内存泄漏:
+      //   response.FQueueItem -> item.FResponse -> response  (双向接口循环)
+      //   item.FSource -> 匿名方法 (captured Self=response) -> response  (隐式循环)
+      // 不在此处释放, 这些引用要等到 connection 释放才能解开, 而 connection
+      // 又被 request.FConnection / response.FConnection 持有, 形成多重循环
+      AItem.Request := nil;
+      AItem.Response := nil;
+      AItem.Source := nil;
+      AItem.Callback := nil;
+
+      // 仅在 happy path 下提前 take 下一个 item; 失败/disconnect 路径不取,
+      // 让 connection 关闭流程清理剩余 queue
+      if ASuccess and (not LNeedDisconnect) then
+        LItemNext := _TryDequeueReadyLocked;
+    end;
+  finally
+    FResponseQueueLock.Leave;
+  end;
+
+  if LDoEnd then
+  begin
+    // 不写 FRequest/FResponse 连接级字段, 这两个字段仅由 _OnParseBegin
+    // 在 _LockRecv 内独占写入. 当前完成 item 的 request/response 通过
+    // LRequest/LResponse 显式传给 DoOnRequestEnd, 进而传给 OnRequestEnd 事件,
+    // 事件 handler 可直接从参数拿到精确对应的请求/响应, 不需要读连接字段
+    Dec(FPending);
+
+    // 用户 callback 可能抛异常, 必须用 try/finally 保证 DoOnRequestEnd 触发
+    try
+      if Assigned(LCallback) then
+        LCallback(Self, ASuccess);
+    finally
+      FServer.DoOnRequestEnd(Self, LRequest, LResponse, ASuccess);
+    end;
+  end;
+
+  if (not ASuccess) or LNeedDisconnect then
+    Disconnect
+  else if (LItemNext <> nil) then
+    _SendQueueItem(LItemNext);
 end;
 
 procedure TCrossHttpConnection._OnBodyBegin;
@@ -2378,35 +2835,51 @@ begin
 end;
 
 function TCrossHttpConnection._OnGetHeaderValue(const AHeaderName: string;
-  out AHeaderValue: string): Boolean;
+  out AHeaderValues: TArray<string>): Boolean;
 begin
-  Result := FRequest.Header.GetParamValue(AHeaderName, AHeaderValue);
+  Result := FRequest.Header.GetHeaderValues(AHeaderName, AHeaderValues);
 end;
 
 procedure TCrossHttpConnection._OnHeaderData(const ADataPtr: Pointer;
   const ADataSize: Integer);
 begin
-  (FRequest as TCrossHttpRequest).ParseHeader(ADataPtr, ADataSize);
+  if not (FRequest as TCrossHttpRequest).ParseHeader(ADataPtr, ADataSize) then
+  begin
+    _OnParseFailed(400, 'Invalid request header.');
+    Abort;
+  end;
 end;
 
 procedure TCrossHttpConnection._OnParseBegin;
+var
+  LItem: IHttpResponseQueueItem;
 begin
   _LockRecv;
   try
-    // 如果开始解析数据之前还有未释放的请求和响应对象
-    // 说明前一次请求的释放还没来得及执行, 新的请求已经来了
-    // 先释放它们
-    if (FPending > 0) then
-    begin
-      ReleaseRequest;
-      ReleaseResponse;
-    end;
-    Inc(FPending);
+    // 为本次请求创建独立的 queue item, 队列顺序由解析顺序决定
+    LItem := THttpResponseQueueItem.Create;
 
     FRequestObj := TCrossHttpRequest.Create(Self);
     FRequest := FRequestObj;
-    FResponseObj := TCrossHttpResponse.Create(Self);
+
+    // 创建响应对象, 显式绑定到 request 和 queue item, 确保异步发送时
+    // 不依赖连接级 FRequest/FResponse 字段
+    FResponseObj := TCrossHttpResponse.Create(Self, FRequest, LItem);
     FResponse := FResponseObj;
+
+    LItem.Request := FRequest;
+    LItem.Response := FResponse;
+
+    FParsingItem := LItem;
+
+    FResponseQueueLock.Enter;
+    try
+      FResponseQueue.Add(LItem);
+    finally
+      FResponseQueueLock.Leave;
+    end;
+
+    Inc(FPending);
   finally
     _UnlockRecv;
   end;
@@ -2424,10 +2897,17 @@ end;
 procedure TCrossHttpConnection._OnParseSuccess;
 var
   LConnection: ICrossHttpConnection;
+  LRequest: ICrossHttpRequest;
+  LResponse: ICrossHttpResponse;
 begin
   LConnection := Self;
-  FServer.DoOnRequestBegin(LConnection);
-  FServer.DoOnRequest(LConnection);
+  // _OnParseSuccess 在 _LockRecv 内, FRequest/FResponse 此刻是 _OnParseBegin 刚写入的
+  // 当前 parse item 的 request/response. 显式捕获后传给后续 protected 方法,
+  // 避免后续过程因连接字段被异步线程修改而读到错位的对象
+  LRequest := FRequest;
+  LResponse := FResponse;
+  FServer.DoOnRequestBegin(LConnection, LRequest, LResponse);
+  FServer.DoOnRequest(LConnection, LRequest, LResponse);
 end;
 
 function IsRegEx(const APattern: string): Boolean; inline;
@@ -3244,6 +3724,7 @@ begin
 
   FCompressible := True;
   FMinCompressSize := MIN_COMPRESS_SIZE;
+  FMaxCompressRatio := DEFAULT_MAX_COMPRESS_RATIO;
   FStoragePath := TCrossHttpUtils.CombinePath(TUtils.AppPath, 'temp', PathDelim) + PathDelim;
   FSessionIDCookieName := SESSIONID_COOKIE_NAME;
 end;
@@ -3294,22 +3775,25 @@ begin
 end;
 
 procedure TCrossHttpServer.DoOnRequestBegin(
-  const AConnection: ICrossHttpConnection);
+  const AConnection: ICrossHttpConnection;
+  const ARequest: ICrossHttpRequest; const AResponse: ICrossHttpResponse);
 begin
   if Assigned(FOnRequestBegin) then
-    FOnRequestBegin(Self, AConnection);
+    FOnRequestBegin(Self, AConnection, ARequest, AResponse);
 end;
 
 procedure TCrossHttpServer.DoOnRequestEnd(
-  const AConnection: ICrossHttpConnection; const ASuccess: Boolean);
+  const AConnection: ICrossHttpConnection;
+  const ARequest: ICrossHttpRequest; const AResponse: ICrossHttpResponse;
+  const ASuccess: Boolean);
 begin
   if Assigned(FOnRequestEnd) then
-    FOnRequestEnd(Self, AConnection, ASuccess);
+    FOnRequestEnd(Self, AConnection, ARequest, AResponse, ASuccess);
 end;
 
-procedure TCrossHttpServer.DoOnRequest(const AConnection: ICrossHttpConnection);
+procedure TCrossHttpServer.DoOnRequest(const AConnection: ICrossHttpConnection;
+  const ARequest: ICrossHttpRequest; const AResponse: ICrossHttpResponse);
 var
-  LHttpConnectionObj: TCrossHttpConnection;
   LRequest: ICrossHttpRequest;
   LResponse: ICrossHttpResponse;
   LSessionID: string;
@@ -3317,9 +3801,10 @@ var
   LHandled: Boolean;
   LRouter: TRouter;
 begin
-  LHttpConnectionObj := AConnection as TCrossHttpConnection;
-  LRequest := LHttpConnectionObj.FRequest;
-  LResponse := LHttpConnectionObj.FResponse;
+  // 显式接收来自 _OnParseSuccess 的 request/response, 不再读取连接字段,
+  // 避免与 _FinishQueueItem 等异步线程构成 race
+  LRequest := ARequest;
+  LResponse := AResponse;
   LHandled := False;
 
   try
@@ -3374,7 +3859,7 @@ begin
     if Assigned(FOnRequest)
       and not (LHandled or LResponse.Sent) then
     begin
-      FOnRequest(Self, LRequest, LResponse, LHandled);
+      FOnRequest(Self, AConnection, LRequest, LResponse, LHandled);
 
       // 如果已经发送了数据, 则后续的事件和路由响应都不需要执行了
       if LHandled or LResponse.Sent then Exit;
@@ -3412,7 +3897,7 @@ begin
   Result := Route('GET', APath, ARouterMethod);
 end;
 
-function TCrossHttpServer.GetOnRequestEnd: TCrossHttpAfterRequestEvent;
+function TCrossHttpServer.GetOnRequestEnd: TCrossHttpRequestEndEvent;
 begin
   Result := FOnRequestEnd;
 end;
@@ -3422,7 +3907,7 @@ begin
   Result := FAutoDeleteFiles;
 end;
 
-function TCrossHttpServer.GetOnRequestBegin: TCrossHttpBeforeRequestEvent;
+function TCrossHttpServer.GetOnRequestBegin: TCrossHttpRequestBeginEvent;
 begin
   Result := FOnRequestBegin;
 end;
@@ -3440,6 +3925,11 @@ end;
 function TCrossHttpServer.GetMaxPostDataSize: Int64;
 begin
   Result := FMaxPostDataSize;
+end;
+
+function TCrossHttpServer.GetMaxCompressRatio: Integer;
+begin
+  Result := FMaxCompressRatio;
 end;
 
 function TCrossHttpServer.GetMinCompressSize: Int64;
@@ -3472,7 +3962,7 @@ begin
   Result := FStoragePath;
 end;
 
-procedure TCrossHttpServer.SetOnRequestEnd(const Value: TCrossHttpAfterRequestEvent);
+procedure TCrossHttpServer.SetOnRequestEnd(const Value: TCrossHttpRequestEndEvent);
 begin
   FOnRequestEnd := Value;
 end;
@@ -3482,7 +3972,7 @@ begin
   FAutoDeleteFiles := Value;
 end;
 
-procedure TCrossHttpServer.SetOnRequestBegin(const Value: TCrossHttpBeforeRequestEvent);
+procedure TCrossHttpServer.SetOnRequestBegin(const Value: TCrossHttpRequestBeginEvent);
 begin
   FOnRequestBegin := Value;
 end;
@@ -3500,6 +3990,11 @@ end;
 procedure TCrossHttpServer.SetMaxPostDataSize(const Value: Int64);
 begin
   FMaxPostDataSize := Value;
+end;
+
+procedure TCrossHttpServer.SetMaxCompressRatio(const Value: Integer);
+begin
+  FMaxCompressRatio := Value;
 end;
 
 procedure TCrossHttpServer.SetMinCompressSize(const Value: Int64);
@@ -3787,7 +4282,7 @@ end;
 
 function TCrossHttpRequest.GetIsChunked: Boolean;
 begin
-  Result := TStrUtils.SameText(FTransferEncoding, 'chunked');
+  Result := TStrUtils.SameText(FTransferEncoding.Trim, 'chunked');
 end;
 
 function TCrossHttpRequest.GetIsMultiPartFormData: Boolean;
@@ -3899,6 +4394,7 @@ function TCrossHttpRequest.ParseHeader(const ADataPtr: Pointer;
   const ADataSize: Integer): Boolean;
 var
   LRequestHeader: string;
+  LCookieValues: TArray<string>;
   I, J: Integer;
 begin
   Assert(Self <> nil, 'FRequest is nil');
@@ -3999,7 +4495,17 @@ begin
   FAcceptEncoding := FHeader[HEADER_ACCEPT_ENCODING];
   FUserAgent := FHeader[HEADER_USER_AGENT];
   FAuthorization := FHeader[HEADER_AUTHORIZATION];
-  FRequestCookies := FHeader[HEADER_COOKIE];
+  // 获取并解析 Cookie 头
+  // RFC 6265 规定客户端应该只发送一个 Cookie 头
+  // 如果存在多个 Cookie 头, 视为无效请求
+  if FHeader.GetHeaderValues(HEADER_COOKIE, LCookieValues)
+    and (Length(LCookieValues) > 0) then
+  begin
+    // 如果存在多个 Cookie 头, 视为无效请求
+    if (Length(LCookieValues) > 1) then Exit(False);
+    FRequestCookies := LCookieValues[0];
+  end else
+    FRequestCookies := '';
   FIfModifiedSince := TCrossHttpUtils.RFC1123_StrToDate(FHeader[HEADER_IF_MODIFIED_SINCE]);
   FIfNoneMatch := FHeader[HEADER_IF_NONE_MATCH];
   FRange := FHeader[HEADER_RANGE];
@@ -4007,7 +4513,11 @@ begin
   FXForwardedFor:= FHeader[HEADER_X_FORWARDED_FOR];
 
   // 解析Cookies
-  FCookies.Decode(FRequestCookies, True);
+  if (FRequestCookies <> '') then
+  begin
+    if not FCookies.Decode(FRequestCookies, True) then Exit(False);
+  end else
+    FCookies.Clear;
 
   if IsMultiPartFormData then
     FBodyType := btMultiPart
@@ -4034,9 +4544,18 @@ end;
 
 constructor TCrossHttpResponse.Create(const AConnection: TCrossHttpConnection);
 begin
+  // 兼容入口: 沿用连接当前的 FRequest, 不绑定 queue item
+  Create(AConnection, AConnection.FRequest, nil);
+end;
+
+constructor TCrossHttpResponse.Create(const AConnection: TCrossHttpConnection;
+  const ARequest: ICrossHttpRequest;
+  const AQueueItem: IHttpResponseQueueItem);
+begin
   FConnectionObj := AConnection;
   FConnection := AConnection;
-  FRequest := FConnectionObj.FRequest;
+  FRequest := ARequest;
+  FQueueItem := AQueueItem;
   FHeader := THttpHeader.Create;
   FCookies := TResponseCookies.Create;
   FStatusCode := 200;
@@ -4046,6 +4565,7 @@ destructor TCrossHttpResponse.Destroy;
 begin
   FreeAndNil(FHeader);
   FreeAndNil(FCookies);
+  FQueueItem := nil;
   inherited;
 end;
 
@@ -4342,8 +4862,7 @@ var
   LRequest: TCrossHttpRequest;
   LLastModifiedStr, LETag: string;
   LRangeStr: string;
-  LRangeStrArr: TArray<string>;
-  LRangeBegin, LRangeEnd, LOffset, LCount: Int64;
+  LRangeBegin, LRangeEnd, LOffset, LCount, LFileSize: Int64;
 begin
   if not FileExists(AFileName) then
   begin
@@ -4389,6 +4908,8 @@ begin
     end;
   end;
 
+  LFileSize := LStream.Size;
+
   // 在响应头中加入文件时间戳
   // 浏览器会根据该时间戳决定是否从本地缓存中直接加载数据
   FHeader[HEADER_LAST_MODIFIED] := LLastModifiedStr;
@@ -4397,49 +4918,38 @@ begin
   // 告诉浏览器支持分块传输
   FHeader[HEADER_ACCEPT_RANGES] := 'bytes';
 
-  // 收到分块取数据头
-  // Range: bytes=[x]-[y]
+  // Range 请求处理 (RFC 7233 §3.1)
+  // 仅当 Range 头存在且 If-Range 校验通过 (无 If-Range 或 If-Range == ETag) 时才走分块逻辑.
+  // If-Range 不匹配时, RFC 7233 §3.2 要求回退为完整 200 响应.
   LRangeStr := LRequest.Range;
   if (LRangeStr <> '')
     and ((LRequest.IfRange = '') or (LRequest.IfRange = LETag)) then
   begin
-    LRangeStr := LRangeStr.Substring(LRangeStr.IndexOf('=') + 1);
-    LRangeStrArr := LRangeStr.Split(['-']);
-    if (Length(LRangeStrArr) >= 2) then
+    if not TCrossHttpUtils.ParseSingleByteRange(LRangeStr, LFileSize, LRangeBegin, LRangeEnd) then
     begin
-      LRangeBegin := StrToInt64Def(LRangeStrArr[0], 0);
-      LRangeEnd := StrToInt64Def(LRangeStrArr[1], 0);
-    end else
-    if (Length(LRangeStrArr) >= 1) then
-    begin
-      LRangeBegin := StrToInt64Def(LRangeStrArr[0], 0);
-      LRangeEnd := LStream.Size - 1;
-    end else
-    begin
-      LRangeBegin := 0;
-      LRangeEnd := LStream.Size - 1;
+      // 不可满足的 Range -> 416 Range Not Satisfiable (RFC 7233 §4.4)
+      // 必须返回 Content-Range: bytes */<size> 告知客户端实际资源大小.
+      FreeAndNil(LStream);
+      FHeader.Remove(HEADER_CONTENT_DISPOSITION);
+      FHeader[HEADER_CONTENT_RANGE] := TStrUtils.Format('bytes */%d', [LFileSize]);
+      SendStatus(416, ACallback);
+      Exit;
     end;
-
-    if (LRangeBegin < 0) then
-      LRangeBegin := 0;
-
-    if (LRangeEnd <= 0) or (LRangeEnd >= LStream.Size) then
-      LRangeEnd := LStream.Size - 1;
 
     LOffset := LRangeBegin;
     LCount := LRangeEnd - LRangeBegin + 1;
 
     // 返回分块信息
-    // Content-Range: bytes [x]-[y]/file-size
+    // Content-Range: bytes <start>-<end>/<size>
     FHeader[HEADER_CONTENT_RANGE] := TStrUtils.Format('bytes %d-%d/%d',
-      [LRangeBegin, LRangeEnd, LStream.Size]);
+      [LRangeBegin, LRangeEnd, LFileSize]);
 
     // 断点续传需要返回206状态码, 而不是200
     FStatusCode := 206;
   end else
   begin
     LOffset := 0;
-    LCount := LStream.Size;
+    LCount := LFileSize;
   end;
 
   Send(LStream, LOffset, LCount,
@@ -4515,7 +5025,7 @@ end;
 function TCrossHttpResponse._CreateHeader(const ABodySize: Int64;
   AChunked: Boolean): TBytes;
 var
-  LHeaderStr, LStatusText: string;
+  LHeaderStr, LStatusText, LHttpVersion: string;
   LCookie: TResponseCookie;
 begin
   if (GetContentType = '') then
@@ -4545,7 +5055,13 @@ begin
     LStatusText := FStatusText
   else
     LStatusText := TCrossHttpUtils.GetHttpStatusText(FStatusCode);
-  LHeaderStr := FRequest.Version + ' ' + FStatusCode.ToString + ' ' +
+
+  // Parser 在 psHeader 阶段早失败时, ParseHeader 尚未运行, FRequest.Version 为空.
+  // 必须回退到 'HTTP/1.1', 否则状态行成 ' 400 Bad Request' (缺版本前缀, 客户端无法识别).
+  LHttpVersion := FRequest.Version;
+  if (LHttpVersion = '') then
+    LHttpVersion := 'HTTP/1.1';
+  LHeaderStr := LHttpVersion + ' ' + FStatusCode.ToString + ' ' +
     LStatusText + #13#10;
 
   for LCookie in FCookies do
@@ -4558,72 +5074,20 @@ end;
 
 procedure TCrossHttpResponse._Send(const ASource: TCrossHttpChunkDataFunc;
   const ACallback: TCrossConnectionCallback);
-var
-  LHttpConnection: ICrossHttpConnection;
-  LHttpConnectionObj: TCrossHttpConnection;
-  LSender: TCrossConnectionCallback;
-  LKeepAlive: Boolean;
-  LStatusCode: Integer;
 begin
+  // FSendStatus 仅作为 GetSent 可见性指示, 不再用作入队闸门
   AtomicIncrement(FSendStatus);
 
-  LHttpConnection := FConnection;
-  LHttpConnectionObj := FConnectionObj;
-  LKeepAlive := FRequest.KeepAlive;
-  LStatusCode := FStatusCode;
-
-  LSender :=
-    procedure(const AConnection: ICrossConnection; const ASuccess: Boolean)
-    var
-      LData: Pointer;
-      LCount: NativeInt;
-    begin
-      if not ASuccess then
-      begin
-        if Assigned(ACallback) then
-          ACallback(AConnection, False);
-
-        LHttpConnectionObj.Close;
-        LHttpConnectionObj._DoOnRequestEnd(False);
-
-        LHttpConnection := nil;
-        LSender := nil;
-
-        Exit;
-      end;
-
-      LData := nil;
-      LCount := 0;
-      if not Assigned(ASource)
-        or not ASource(@LData, @LCount)
-        or (LData = nil)
-        or (LCount <= 0) then
-      begin
-        if Assigned(ACallback) then
-          ACallback(AConnection, True);
-
-        if not LKeepAlive
-          or (LStatusCode >= 400{如果发送的是出错状态码, 则发送完成之后断开连接}) then
-          LHttpConnectionObj.Disconnect;
-
-        LHttpConnectionObj._DoOnRequestEnd(True);
-
-        LHttpConnection := nil;
-        LSender := nil;
-
-        Exit;
-      end;
-
-      AConnection.SendBuf(LData^, LCount, LSender);
-    end;
-
-  try
-    LSender(LHttpConnection, True);
-  except
-    LHttpConnection := nil;
-    LSender := nil;
-    raise;
+  if (FConnectionObj = nil) or (FQueueItem = nil) then
+  begin
+    // 没有绑定 queue item, 说明响应对象不在队列控制下, 直接以失败回调
+    if Assigned(ACallback) then
+      ACallback(FConnection, False);
+    Exit;
   end;
+
+  // 实际发送由连接级响应队列串行调度, 这里只负责将本响应标记为 ready
+  FConnectionObj._QueueResponseReady(FQueueItem, ASource, ACallback);
 end;
 
 procedure TCrossHttpResponse._Send(const AHeaderSource,

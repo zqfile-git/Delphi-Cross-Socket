@@ -96,7 +96,13 @@ type
     /// <summary>
     ///   响应包含Connection: close, 连接需要关闭
     /// </summary>
-    rsClose);
+    rsClose,
+
+    /// <summary>
+    ///   协议已升级 (HTTP/1.1 101 Switching Protocols), 连接由上层协议(如 WebSocket)接管,
+    ///   不再参与 HTTP 请求队列复用、idleout 与 RequestTimeout 检查
+    /// </summary>
+    rsUpgraded);
 
   {$REGION 'Documentation'}
   /// <summary>
@@ -405,6 +411,9 @@ type
     /// <param name="AMaxConnsPerServer">
     ///   每个服务器最大连接数
     /// </param>
+    /// <param name="AMaxCompressRatio">
+    ///   gzip/deflate 解压最大压缩比 (仅影响后续新建连接的 parser)
+    /// </param>
     /// <param name="AReUseConnection">
     ///   是否重用连接
     /// </param>
@@ -412,7 +421,7 @@ type
     ///   是否自动URL编码
     /// </param>
     {$ENDREGION}
-    procedure SyncOptions(const AMaxConnsPerServer: Integer;
+    procedure SyncOptions(const AMaxConnsPerServer, AMaxCompressRatio: Integer;
       const AReUseConnection, AAutoUrlEncode: Boolean);
 
     /// <summary>
@@ -431,6 +440,7 @@ type
     function GetIdleout: Integer;
     function GetIoThreads: Integer;
     function GetMaxConnsPerServer: Integer;
+    function GetMaxCompressRatio: Integer;
     function GetReUseConnection: Boolean;
     function GetRequestTimeout: Integer;
     function GetConnectTimeout: Integer;
@@ -440,6 +450,7 @@ type
     procedure SetIdleout(const AValue: Integer);
     procedure SetIoThreads(const AValue: Integer);
     procedure SetMaxConnsPerServer(const AValue: Integer);
+    procedure SetMaxCompressRatio(const AValue: Integer);
     procedure SetReUseConnection(const AValue: Boolean);
     procedure SetRequestTimeout(const AValue: Integer);
     procedure SetConnectTimeout(const AValue: Integer);
@@ -755,6 +766,19 @@ type
     property MaxConnsPerServer: Integer read GetMaxConnsPerServer write SetMaxConnsPerServer;
 
     /// <summary>
+    ///   gzip/deflate 解压时的最大压缩比 (DecodedSize / EncodedSize)
+    /// </summary>
+    /// <remarks>
+    ///   <list type="bullet">
+    ///     <item>&gt; 0, 解压输出与输入比超过该值则按 zip bomb 拒绝 (400)</item>
+    ///     <item>= 0, 不做压缩比检查</item>
+    ///   </list>
+    ///   合法 gzip 通常 1.5-15:1, 极规整数据可达 100-500:1
+    ///   经典 zip bomb 1000:1 起 (42.zip ~100000:1), 默认 1000:1 兜底拦截 bomb
+    /// </remarks>
+    property MaxCompressRatio: Integer read GetMaxCompressRatio write SetMaxCompressRatio;
+
+    /// <summary>
     ///   是否重用连接
     /// </summary>
     property ReUseConnection: Boolean read GetReUseConnection write SetReUseConnection;
@@ -804,7 +828,7 @@ type
     FReqLock: ILock;
 
     procedure _OnHeaderData(const ADataPtr: Pointer; const ADataSize: Integer);
-    function _OnGetHeaderValue(const AHeaderName: string; out AHeaderValue: string): Boolean;
+    function _OnGetHeaderValue(const AHeaderName: string; out AHeaderValues: TArray<string>): Boolean;
     procedure _OnBodyBegin;
     procedure _OnBodyData(const ADataPtr: Pointer; const ADataSize: Integer);
     procedure _OnBodyEnd;
@@ -1063,7 +1087,7 @@ type
     FHttpClient: TCrossHttpClient;
     FReUseConnection, FAutoUrlEncode: Boolean;
     FCompressType: TCompressType;
-    FMaxConnsPerServer: Integer;
+    FMaxConnsPerServer, FMaxCompressRatio: Integer;
     FServerDockDict: TServerDockDict;
     FServerDockLock: ILock;
     FLocalPort: Word;
@@ -1086,13 +1110,13 @@ type
     procedure LogicDisconnected(const AConnection: ICrossConnection); override;
   public
     constructor Create(const AHttpClient: TCrossHttpClient;
-      const AIoThreads, AMaxConnsPerServer: Integer;
+      const AIoThreads, AMaxConnsPerServer, AMaxCompressRatio: Integer;
       const ASsl, AReUseConnection, AAutoUrlEncode: Boolean;
       const ACompressType: TCompressType = ctNone); reintroduce; virtual;
     destructor Destroy; override;
 
     procedure CancelAllRequests;
-    procedure SyncOptions(const AMaxConnsPerServer: Integer;
+    procedure SyncOptions(const AMaxConnsPerServer, AMaxCompressRatio: Integer;
       const AReUseConnection, AAutoUrlEncode: Boolean);
 
     // 所有请求方法的核心
@@ -1109,7 +1133,7 @@ type
     class constructor Create;
     class function GetDefault: ICrossHttpClient; static;
   private
-    FIoThreads, FMaxConnsPerServer: Integer;
+    FIoThreads, FMaxConnsPerServer, FMaxCompressRatio: Integer;
     FCompressType: TCompressType;
     FLock: ILock;
     FTimer: IEasyTimer;
@@ -1130,6 +1154,7 @@ type
     function GetIdleout: Integer;
     function GetIoThreads: Integer;
     function GetMaxConnsPerServer: Integer;
+    function GetMaxCompressRatio: Integer;
     function GetReUseConnection: Boolean;
     function GetRequestTimeout: Integer;
     function GetConnectTimeout: Integer;
@@ -1139,6 +1164,7 @@ type
     procedure SetIdleout(const AValue: Integer);
     procedure SetIoThreads(const AValue: Integer);
     procedure SetMaxConnsPerServer(const AValue: Integer);
+    procedure SetMaxCompressRatio(const AValue: Integer);
     procedure SetReUseConnection(const AValue: Boolean);
     procedure SetRequestTimeout(const AValue: Integer);
     procedure SetConnectTimeout(const AValue: Integer);
@@ -1222,6 +1248,7 @@ type
     property Idleout: Integer read GetIdleout write SetIdleout;
     property IoThreads: Integer read GetIoThreads write SetIoThreads;
     property MaxConnsPerServer: Integer read GetMaxConnsPerServer write SetMaxConnsPerServer;
+    property MaxCompressRatio: Integer read GetMaxCompressRatio write SetMaxCompressRatio;
     property ReUseConnection: Boolean read GetReUseConnection write SetReUseConnection;
     property RequestTimeout: Integer read GetRequestTimeout write SetRequestTimeout;
     property ConnectTimeout: Integer read GetConnectTimeout write SetConnectTimeout;
@@ -1244,7 +1271,11 @@ var
 begin
   inherited Create(AOwner, AClientSocket, AConnectType, AHost, AConnectCb);
 
+  LHttpClientSocket := AOwner as TCrossHttpClientSocket;
+
   FHttpParser := TCrossHttpParser.Create(pmClient);
+  // 透传压缩比限制 (zip bomb 防御); 直接读 socket 字段, 与其它配置 (CompressType / AutoUrlEncode) 取值方式一致
+  FHttpParser.MaxCompressRatio := LHttpClientSocket.FMaxCompressRatio;
   FHttpParser.OnHeaderData := _OnHeaderData;
   FHttpParser.OnGetHeaderValue := _OnGetHeaderValue;
   FHttpParser.OnBodyBegin := _OnBodyBegin;
@@ -1746,7 +1777,7 @@ procedure TCrossHttpClientConnection.TriggerResponseSuccess;
 var
   LCallback: TCrossHttpResponseProc;
   LResponse: ICrossHttpClientResponse;
-  LRequestEnded: Boolean;
+  LRequestEnded, LIsSwitching: Boolean;
 begin
   LCallback := nil;
   LResponse := nil;
@@ -1763,12 +1794,21 @@ begin
     LResponse := FResponse;
     LRequestEnded := True;
 
+    // HTTP/1.1 101 Switching Protocols: 协议升级, 连接由上层协议(如 WebSocket)接管,
+    // 不能 close, 也不能进入 idle 池被复用为 HTTP 请求.
+    LIsSwitching := (FResponseObj <> nil)
+      and (FResponseObj.FStatusCode = 101);
+
     if IsClosed
-      or (not (Owner as TCrossHttpClientSocket).FReUseConnection)
-      or SameText(FResponseObj.FHeader[HEADER_CONNECTION], 'close') then
+      or ((not LIsSwitching)
+        and ((not (Owner as TCrossHttpClientSocket).FReUseConnection)
+          or SameText(FResponseObj.FHeader[HEADER_CONNECTION], 'close'))) then
     begin
       _SetRequestStatus(rsClose);
       Close;
+    end else if LIsSwitching then
+    begin
+      _SetRequestStatus(rsUpgraded);
     end else
     begin
       _UpdateWatch;
@@ -1895,9 +1935,19 @@ begin
     if (FRequestObj.FHeader[HEADER_CROSS_HTTP_CLIENT] = '') then
       FRequestObj.FHeader[HEADER_CROSS_HTTP_CLIENT] := CROSS_HTTP_CLIENT_NAME;
 
-    LPathStr := FRequestObj.FPathAndParams;
     if FAutoUrlEncode then
-      LPathStr := TCrossHttpUtils.UrlEncode(LPathStr, ['/', '?', '=', '&']);
+    begin
+      // 按 RFC 3986 分组件编码:
+      //   path: pchar = unreserved / pct-encoded / sub-delims / ":" / "@", 段间 "/"
+      //         APreserveEncoded=True 启用 Normalizer 语义, 识别已有 %xx 序列,
+      //         避免二次编码 (RFC 3986 §2.4 "MUST NOT encode the same string more than once")
+      //   query: 由 FQuery.Encode 处理, 内部 key/value 已被 SetUrl 阶段 Decode 到原始字节,
+      //          重新编码时 key/value 均按严格 unreserved 集编码 (&/=/% 等都正确转义).
+      LPathStr := TCrossHttpUtils.UrlEncode(FRequestObj.FPath, ['/', ':', '@'], True);
+      if (FRequestObj.FQuery.Count > 0) then
+        LPathStr := LPathStr + '?' + FRequestObj.FQuery.Encode;
+    end else
+      LPathStr := FRequestObj.FPathAndParams;
 
     // 设置请求行
     LHeaderStr := FRequestObj.FMethod + ' '
@@ -1980,13 +2030,13 @@ begin
 end;
 
 function TCrossHttpClientConnection._OnGetHeaderValue(const AHeaderName: string;
-  out AHeaderValue: string): Boolean;
+  out AHeaderValues: TArray<string>): Boolean;
 begin
   if (FResponseObj <> nil) then
-    Result := FResponseObj.FHeader.GetParamValue(AHeaderName, AHeaderValue)
+    Result := FResponseObj.FHeader.GetHeaderValues(AHeaderName, AHeaderValues)
   else
   begin
-    AHeaderValue := '';
+    SetLength(AHeaderValues, 0);
     Result := False;
   end;
 end;
@@ -2358,6 +2408,7 @@ var
   LResponseFirstLine, LResponseHeader: string;
   I, J: Integer;
   LHeader: TNameValue;
+  LCookie: TResponseCookie;
 begin
   {
   HTTP/1.1 200 OK
@@ -2399,7 +2450,11 @@ begin
   for LHeader in FHeader do
   begin
     if TStrUtils.SameText(LHeader.Name, HEADER_SETCOOKIE) then
-      FCookies.Add(TResponseCookie.Create(LHeader.Value, FConnectionObj.FHost));
+    begin
+      LCookie := TResponseCookie.Create(LHeader.Value, FConnectionObj.FHost);
+      if (LCookie.Name <> '') then
+        FCookies.Add(LCookie);
+    end;
   end;
 
   FContentType := FHeader[HEADER_CONTENT_TYPE];
@@ -2471,7 +2526,7 @@ end;
 { TCrossHttpClientSocket }
 
 constructor TCrossHttpClientSocket.Create(const AHttpClient: TCrossHttpClient;
-  const AIoThreads, AMaxConnsPerServer: Integer;
+  const AIoThreads, AMaxConnsPerServer, AMaxCompressRatio: Integer;
   const ASsl, AReUseConnection, AAutoUrlEncode: Boolean;
   const ACompressType: TCompressType);
 begin
@@ -2479,6 +2534,7 @@ begin
   FReUseConnection := AReUseConnection;
   FAutoUrlEncode := AAutoUrlEncode;
   FMaxConnsPerServer := AMaxConnsPerServer;
+  FMaxCompressRatio := AMaxCompressRatio;
   FCompressType := ACompressType;
 
   inherited Create(AIoThreads, ASsl);
@@ -2581,10 +2637,11 @@ begin
   inherited LogicDisconnected(AConnection);
 end;
 
-procedure TCrossHttpClientSocket.SyncOptions(const AMaxConnsPerServer: Integer;
-  const AReUseConnection, AAutoUrlEncode: Boolean);
+procedure TCrossHttpClientSocket.SyncOptions(const AMaxConnsPerServer,
+  AMaxCompressRatio: Integer; const AReUseConnection, AAutoUrlEncode: Boolean);
 begin
   FMaxConnsPerServer := AMaxConnsPerServer;
+  FMaxCompressRatio := AMaxCompressRatio;
   FReUseConnection := AReUseConnection;
   FAutoUrlEncode := AAutoUrlEncode;
 end;
@@ -2691,6 +2748,7 @@ begin
 
   FIoThreads := AIoThreads;
   FMaxConnsPerServer := AMaxConnsPerServer;
+  FMaxCompressRatio := DEFAULT_MAX_COMPRESS_RATIO;
   FCompressType := ACompressType;
   FLock := TLock.Create;
   FHttpCliArr := [];
@@ -2741,7 +2799,7 @@ begin
     if (FHttpCli = nil) then
     begin
       FHttpCli := TCrossHttpClientSocket.Create(Self, FIoThreads,
-        FMaxConnsPerServer, False,
+        FMaxConnsPerServer, FMaxCompressRatio, False,
         FReUseConnection, FAutoUrlEncode,
         FCompressType);
       FHttpCliArr := FHttpCliArr + [FHttpCli];
@@ -2754,7 +2812,7 @@ begin
     if (FHttpsCli = nil) then
     begin
       FHttpsCli := TCrossHttpClientSocket.Create(Self, FIoThreads,
-        FMaxConnsPerServer, True,
+        FMaxConnsPerServer, FMaxCompressRatio, True,
         FReUseConnection, FAutoUrlEncode,
         FCompressType);
       FHttpCliArr := FHttpCliArr + [FHttpsCli];
@@ -3070,7 +3128,8 @@ var
 begin
   for LHttpCli in FHttpCliArr do
     LHttpCli.SyncOptions(
-      FMaxConnsPerServer, FReUseConnection, FAutoUrlEncode);
+      FMaxConnsPerServer, FMaxCompressRatio,
+      FReUseConnection, FAutoUrlEncode);
 end;
 
 procedure TCrossHttpClient.DoRequest(const AMethod, AUrl: string;
@@ -3171,6 +3230,11 @@ begin
   Result := FMaxConnsPerServer;
 end;
 
+function TCrossHttpClient.GetMaxCompressRatio: Integer;
+begin
+  Result := FMaxCompressRatio;
+end;
+
 function TCrossHttpClient.GetReUseConnection: Boolean;
 begin
   Result := FReUseConnection;
@@ -3218,6 +3282,13 @@ end;
 procedure TCrossHttpClient.SetLocalPort(const AValue: Word);
 begin
   FLocalPort := AValue;
+end;
+
+procedure TCrossHttpClient.SetMaxCompressRatio(const AValue: Integer);
+begin
+  // 同步到所有已创建的 socket; 已建立的 connection 上 parser 已用旧值, 仅影响后续新建连接.
+  FMaxCompressRatio := AValue;
+  _UpdateCliOptions;
 end;
 
 procedure TCrossHttpClient.SetMaxConnsPerServer(const AValue: Integer);
@@ -3578,12 +3649,16 @@ procedure TServerDock.RemoveConnection(
 var
   LNeedProcNext: Boolean;
 begin
-  LNeedProcNext := (AConnection as TCrossHttpClientConnection).GetRequestStatus = rsIdle;
-
   _Lock;
   try
     AtomicDecrement(FConnCount);
     FConnections.Remove(AConnection);
+
+    // 连接被移除后, 只要队列里还有积压请求就推进 (P0-1 防御性加固).
+    // 原逻辑用 (GetRequestStatus = rsIdle) 判断, 但连接已在被移除, 此判断意义不明,
+    // 且漏掉 rsClose / rsRespondFailed / rsRespondTimeout 等状态. 在异步 IO 路径下
+    // (LogicDisconnected 跨线程触发) 可能造成排队请求得不到处理.
+    LNeedProcNext := (FRequestQueue.Count > 0);
   finally
     _Unlock;
   end;

@@ -140,6 +140,9 @@ type
     /// <summary>
     ///   对参数排序
     /// </summary>
+    /// <param name="AComparison">
+    ///   自定义比较函数，为nil时按参数名排序
+    /// </param>
     procedure Sort(const AComparison: TNameValueComparison = nil);
 
     /// <summary>
@@ -151,31 +154,78 @@ type
     /// <param name="AClear">
     ///   是否清除现有数据
     /// </param>
+    /// <returns>
+    ///   解码是否成功
+    /// </returns>
     function Decode(const AEncodedParams: string; AClear: Boolean = True): Boolean; virtual; abstract;
 
     /// <summary>
     ///   编码为字符串
     /// </summary>
+    /// <returns>
+    ///   编码后的字符串
+    /// </returns>
     function Encode: string; virtual; abstract;
 
     /// <summary>
     ///   获取参数值
     /// </summary>
+    /// <param name="AName">
+    ///   参数名称
+    /// </param>
+    /// <param name="AValue">
+    ///   返回的参数值
+    /// </param>
+    /// <returns>
+    ///   如果找到参数返回True，否则返回False
+    /// </returns>
     function GetParamValue(const AName: string; out AValue: string): Boolean;
+
+    /// <summary>
+    ///   获取指定名称的所有参数值
+    /// </summary>
+    /// <param name="AName">
+    ///   参数名称
+    /// </param>
+    /// <param name="AValues">
+    ///   返回的参数值数组
+    /// </param>
+    /// <returns>
+    ///   如果找到参数返回True，否则返回False
+    /// </returns>
+    function GetHeaderValues(const AName: string; out AValues: TArray<string>): Boolean;
 
     /// <summary>
     ///   是否存在参数
     /// </summary>
+    /// <param name="AName">
+    ///   参数名称
+    /// </param>
+    /// <returns>
+    ///   如果存在参数返回True，否则返回False
+    /// </returns>
     function ExistsParam(const AName: string): Boolean;
 
     /// <summary>
     ///   按名称访问参数
     /// </summary>
+    /// <param name="AName">
+    ///   参数名称
+    /// </param>
+    /// <value>
+    ///   参数值，如果不存在返回空字符串
+    /// </value>
     property Params[const AName: string]: string read GetParam write SetParam; default;
 
     /// <summary>
     ///   按序号访问参数
     /// </summary>
+    /// <param name="AIndex">
+    ///   参数序号
+    /// </param>
+    /// <value>
+    ///   参数名值对
+    /// </value>
     property Items[AIndex: Integer]: TNameValue read GetItem write SetItem;
 
     /// <summary>
@@ -1149,6 +1199,103 @@ type
 
 implementation
 
+function _IsHttpToken(const AValue: string): Boolean;
+var
+  I: Integer;
+begin
+  if (AValue = '') then Exit(False);
+
+  for I := 1 to Length(AValue) do
+  begin
+    case AValue[I] of
+      'A'..'Z', 'a'..'z', '0'..'9',
+      '!', '#', '$', '%', '&', '''', '*', '+', '-', '.', '^', '_', '`', '|', '~': ;
+    else
+      Exit(False);
+    end;
+  end;
+
+  Result := True;
+end;
+
+function _IsCookieOctets(const AValue: string): Boolean;
+var
+  I, LCode: Integer;
+begin
+  for I := 1 to Length(AValue) do
+  begin
+    LCode := Ord(AValue[I]);
+    case LCode of
+      $21,           // '!'
+      $23..$2B,      // '#' to '+'
+      $2D..$3A,      // '-' to ':'
+      $3C..$5B,      // '<' to '['
+      $5D..$7E: ;    // ']' to '~'
+    else
+      Exit(False);
+    end;
+  end;
+
+  Result := True;
+end;
+
+function _IsCookieAvValue(const AValue: string): Boolean;
+var
+  I, LCode: Integer;
+begin
+  for I := 1 to Length(AValue) do
+  begin
+    LCode := Ord(AValue[I]);
+    if (LCode < $20) or (LCode >= $7F) or (AValue[I] = ';') then
+      Exit(False);
+  end;
+
+  Result := True;
+end;
+
+function _TryNormalizeCookieValue(const AValue: string; out ANormalizedValue: string): Boolean;
+begin
+  ANormalizedValue := AValue;
+  if (Length(ANormalizedValue) >= 2) then
+    if (ANormalizedValue[1] = '"')
+      and (ANormalizedValue[High(ANormalizedValue)] = '"') then
+      ANormalizedValue := Copy(ANormalizedValue, 2, Length(ANormalizedValue) - 2);
+
+  Result := _IsCookieOctets(ANormalizedValue);
+end;
+
+function _NormalizeCookieDomain(const AValue: string): string;
+begin
+  if not _IsCookieAvValue(AValue) then Exit('');
+
+  Result := AValue.Trim.ToLower;
+  if (Result <> '') then
+    if (Result[1] = '.') then
+      Delete(Result, 1, 1);
+end;
+
+function _TryParseCookieMaxAge(const AValue: string; out AMaxAge: Integer): Boolean;
+var
+  I: Integer;
+begin
+  AMaxAge := 0;
+  Result := False;
+  if (AValue = '') then Exit;
+
+  if (AValue[1] = '-') then
+  begin
+    if (Length(AValue) = 1) then Exit;
+    for I := 2 to Length(AValue) do
+      if not CharInSet(AValue[I], ['0'..'9']) then Exit;
+  end else
+  begin
+    for I := 1 to Length(AValue) do
+      if not CharInSet(AValue[I], ['0'..'9']) then Exit;
+  end;
+
+  Result := TryStrToInt(AValue, AMaxAge);
+end;
+
 { TNameValue }
 
 constructor TNameValue.Create(const AName,
@@ -1260,6 +1407,24 @@ begin
   Result := False;
 end;
 
+function TBaseParams.GetHeaderValues(const AName: string;
+  out AValues: TArray<string>): Boolean;
+var
+  I, LCount: Integer;
+begin
+  SetLength(AValues, FParams.Count);
+  LCount := 0;
+  Result := False;
+  for I := 0 to FParams.Count - 1 do
+  begin
+    if not TStrUtils.SameText(FParams[I].Name, AName) then Continue;
+    AValues[LCount] := FParams[I].Value;
+    Inc(LCount);
+    Result := True;
+  end;
+  SetLength(AValues, LCount);
+end;
+
 procedure TBaseParams.Remove(const AName: string);
 var
   I: Integer;
@@ -1346,7 +1511,11 @@ constructor THttpUrlParams.Create;
 begin
   inherited Create;
 
-  FEncodeName := False;
+  // RFC 3986 / WHATWG application/x-www-form-urlencoded:
+  // key 与 value 内含的 reserved/非 unreserved 字符都必须 percent-encode,
+  // 否则 key 中的 '&'/'='/'#' 等会被服务端误解析 (参数注入风险).
+  // 与 Go url.Values.Encode / Python urlencode / Java URLEncoder 等主流库默认行为一致.
+  FEncodeName := True;
   FEncodeValue := True;
 end;
 
@@ -1426,52 +1595,110 @@ end;
 { THttpHeader }
 
 function THttpHeader.Decode(const AEncodedParams: string; AClear: Boolean): Boolean;
+const
+  CR = #13;
+  LF = #10;
 var
-  p, pEnd, q: PChar;
+  P, PEnd, LLineStart, LColonPos, LValueStart, LValueEnd: PChar;
+  LCh: Char;
   LName, LValue: string;
-  LSize: Integer;
+  LLineValid, LInName: Boolean;
 begin
   if AClear then
     FParams.Clear;
 
-  p := PChar(AEncodedParams);
-  pEnd := p + Length(AEncodedParams);
-  while (p < pEnd) do
+  P := PChar(AEncodedParams);
+  PEnd := P + Length(AEncodedParams);
+
+  // 单趟状态机解析 (RFC 7230 §3): 每行字符仅访问 1 次, 同时完成
+  //   1) CRLF 边界检测 + bare-CR / bare-LF 拒绝
+  //   2) ':' 定位 (切 name / value)
+  //   3) value 前后 OWS 跳过 + 尾随 OWS 自动 trim (LValueEnd 指向最后非 OWS 后的位置)
+  //   4) name 每字节 token 校验 + value 每字节 CTL 校验
+  //  非法行整行跳过, 与 THttpHeader.Encode 过滤策略对称, 作为深度防御
+  //  (覆盖 multipart part header / WebSocket 内部 header / 测试构造等其他调用点).
+  while (P < PEnd) do
   begin
-    // 跳过多余的#13#10
-    while (p < pEnd) and ((p^ = #13) or (p^ = #10)) do
-      Inc(p);
-    if (p >= pEnd) then Break;
+    LLineStart := P;
+    LColonPos := nil;
+    LValueStart := nil;
+    LValueEnd := nil;
+    LLineValid := True;
+    LInName := True;
 
-    q := p;
-    LSize := 0;
-    while (p < pEnd) and (p^ <> ':') do
+    // 内层: 逐字节扫描本行, 直到 CRLF 或 PEnd
+    while (P < PEnd) do
     begin
-      Inc(LSize);
-      Inc(p);
+      LCh := P^;
+
+      if (LCh = CR) then
+      begin
+        if (P + 1 < PEnd) and ((P + 1)^ = LF) then
+          Break; // 完整 CRLF: 退出内层, P 仍指向 CR
+        // bare-CR: 标记非法但继续推进 (保持行对齐到下一个 CRLF)
+        LLineValid := False;
+        Inc(P);
+        Continue;
+      end;
+
+      if (LCh = LF) then
+      begin
+        // bare-LF (前置 CR 情况已在上面 Break)
+        LLineValid := False;
+        Inc(P);
+        Continue;
+      end;
+
+      if LInName then
+      begin
+        if (LCh = ':') then
+        begin
+          LColonPos := P;
+          LInName := False;
+        end else
+        if not TCrossHttpUtils.IsTokenChar(LCh) then
+          // name 段非 token 字符 (含 OWS / CTL / 非 ASCII 等) → 非法
+          LLineValid := False;
+      end else
+      begin
+        // value 段: 前导 OWS 跳过, 记录首/末非 OWS 位置, 同时校验 CTL
+        if (LCh <> ' ') and (LCh <> #9) then
+        begin
+          if (LValueStart = nil) then
+            LValueStart := P;
+          LValueEnd := P + 1; // exclusive: 最后非 OWS 字符之后位置
+          if not TCrossHttpUtils.IsHeaderValueChar(LCh) then
+            LLineValid := False;
+        end;
+      end;
+
+      Inc(P);
     end;
 
-    SetLength(LName, LSize);
-    Move(q^, Pointer(LName)^, LSize * SizeOf(Char));
+    // 退出内层: 要么 P 指向 CR (CRLF 完整), 要么 P >= PEnd (末尾不完整)
+    if (P >= PEnd) then Break; // 末尾残片整段丢弃
 
-    // 跳过多余的':'
-    while (p < pEnd) and ((p^ = ':') or (p^ = ' ')) do
-      Inc(p);
+    Inc(P, 2); // 跳过 CRLF
 
-    q := p;
-    LSize := 0;
-    while (p < pEnd) and (p^ <> #13) do
-    begin
-      Inc(LSize);
-      Inc(p);
-    end;
-    SetLength(LValue, LSize);
-    Move(q^, Pointer(LValue)^, LSize * SizeOf(Char));
-    Add(LName, LValue);
+    if not LLineValid then Continue;
 
-    // 跳过多余的#13#10
-    while (p < pEnd) and ((p^ = #13) or (p^ = #10)) do
-      Inc(p);
+    // 空行: header 块结束标记, 跳过 (LLineStart 等于 CRLF 位置, 即 P-2)
+    if (LLineStart = P - 2) then Continue;
+
+    // 必须出现过 ':'
+    if (LColonPos = nil) then Continue;
+
+    // name 不能为空
+    if (LColonPos = LLineStart) then Continue;
+
+    SetString(LName, LLineStart, LColonPos - LLineStart);
+
+    if (LValueStart = nil) then
+      LValue := ''
+    else
+      SetString(LValue, LValueStart, LValueEnd - LValueStart);
+
+    Add(LName, LValue, True);
   end;
 
   Result := (Self.Count > 0);
@@ -1480,12 +1707,21 @@ end;
 function THttpHeader.Encode: string;
 var
   I: Integer;
+  LName, LValue: string;
 begin
+  // 防御 HTTP 响应拆分 (Response Splitting):
+  //   Header name 必须是 RFC 7230 token, value 不允许 CR/LF/CTL.
+  //   非法 entry 直接跳过 (业务方应在写入前自行 sanitize), 避免拼到 wire 上注入伪造响应.
   Result := '';
   for I := 0 to FParams.Count - 1 do
   begin
-    Result := Result + FParams[I].Name;
-    Result := Result + ': ' + FParams[I].Value + #13#10;
+    LName := FParams[I].Name;
+    LValue := FParams[I].Value;
+
+    if not TCrossHttpUtils.IsValidHeaderName(LName) then Continue;
+    if not TCrossHttpUtils.IsValidHeaderValue(LValue) then Continue;
+
+    Result := Result + LName + ': ' + LValue + #13#10;
   end;
   Result := Result + #13#10;
 end;
@@ -1577,60 +1813,86 @@ end;
 
 function TRequestCookies.Decode(const AEncodedParams: string; AClear: Boolean): Boolean;
 var
-  p, pEnd, q: PChar;
+  LParsedParams: TList<TNameValue>;
+  LItem: TNameValue;
+  LPos, LLen, LPairEnd, LEqualsPos: Integer;
+  LPair: string;
   LName, LValue: string;
-  LSize: Integer;
+  LNormalizedValue: string;
 begin
-  if AClear then
-    FParams.Clear;
-
-  p := PChar(AEncodedParams);
-  pEnd := p + Length(AEncodedParams);
-  while (p < pEnd) do
-  begin
-    q := p;
-    LSize := 0;
-    while (p < pEnd) and (p^ <> '=') do
+  Result := False;
+  // 先解析到临时列表，确保整行 Cookie 全部合法后再提交，避免失败时留下半解析数据。
+  LParsedParams := TList<TNameValue>.Create;
+  try
+    LLen := Length(AEncodedParams);
+    LPos := 1;
+    while (LPos <= LLen) do
     begin
-      Inc(LSize);
-      Inc(p);
-    end;
-    SetLength(LName, LSize);
-    Move(q^, Pointer(LName)^, LSize * SizeOf(Char));
-    // 跳过多余的'='
-    while (p < pEnd) and (p^ = '=') do
-      Inc(p);
+      // 跳过空白字符(空格和制表符)
+      while (LPos <= LLen) and CharInSet(AEncodedParams[LPos], [' ', #9]) do
+        Inc(LPos);
+      if (LPos > LLen) then Break;
 
-    q := p;
-    LSize := 0;
-    while (p < pEnd) and (p^ <> ';') do
-    begin
-      Inc(LSize);
-      Inc(p);
-    end;
-    SetLength(LValue, LSize);
-    Move(q^, Pointer(LValue)^, LSize * SizeOf(Char));
-    LValue := TCrossHttpUtils.UrlDecode(LValue);
-    // 跳过多余的';'
-    while (p < pEnd) and ((p^ = ';') or (p^ = ' ')) do
-      Inc(p);
+      LPairEnd := LPos;
+      // 查找分号分隔符, 确定当前 cookie-pair 的结束位置
+      while (LPairEnd <= LLen) and (AEncodedParams[LPairEnd] <> ';') do
+        Inc(LPairEnd);
 
-    Add(LName, LValue);
+      // 提取当前 cookie-pair 字符串
+      LPair := Copy(AEncodedParams, LPos, LPairEnd - LPos);
+      // 查找等号位置, 用于分割 name 和 value
+      LEqualsPos := Pos('=', LPair);
+      // 如果没有等号或等号在第一个位置(name 为空), 则认为格式非法
+      if (LEqualsPos <= 1) then
+      begin
+        if AClear then FParams.Clear;
+        Exit;
+      end;
+
+      // 提取 name 部分（等号之前的内容）
+      LName := Copy(LPair, 1, LEqualsPos - 1);
+      // 提取 value 部分（等号之后的所有内容）
+      LValue := Copy(LPair, LEqualsPos + 1, MaxInt);
+      // 校验 name 是否为合法的 HTTP token, 以及 value 是否为合法的 cookie 值
+      if not _IsHttpToken(LName)
+        or not _TryNormalizeCookieValue(LValue, LNormalizedValue) then
+      begin
+        if AClear then FParams.Clear;
+        Exit;
+      end;
+
+      LParsedParams.Add(TNameValue.Create(LName, LNormalizedValue));
+      LPos := LPairEnd + 1;
+    end;
+
+    // 所有 cookie-pair 均校验通过后，才按 AClear 语义提交到 FParams。
+    if AClear then
+      FParams.Clear;
+    for LItem in LParsedParams do
+      Add(LItem.Name, LItem.Value);
+    Result := (Self.Count > 0);
+  finally
+    FreeAndNil(LParsedParams);
   end;
-
-  Result := (Self.Count > 0);
 end;
 
 function TRequestCookies.Encode: string;
 var
   I: Integer;
+  LName, LValue: string;
 begin
   Result := '';
   for I := 0 to FParams.Count - 1 do
   begin
     if (I > 0) then
       Result := Result + '; ';
-    Result := Result + FParams[I].Name + '=' + TCrossHttpUtils.UrlEncode(FParams[I].Value);
+    LName := FParams[I].Name;
+    LValue := FParams[I].Value;
+    if not _IsHttpToken(LName) then
+      raise Exception.CreateFmt('Invalid cookie name: %s', [LName]);
+    if not _IsCookieOctets(LValue) then
+      raise Exception.CreateFmt('Invalid cookie value: %s', [LName]);
+    Result := Result + LName + '=' + LValue;
   end;
 end;
 
@@ -1643,7 +1905,7 @@ begin
   Self.Value := AValue;
   Self.MaxAge := AMaxAge;
   Self.Path := APath;
-  Self.Domain := ADomain;
+  Self.Domain := _NormalizeCookieDomain(ADomain);
   Self.HttpOnly := AHttpOnly;
   Self.Secure := ASecure;
 end;
@@ -1660,22 +1922,23 @@ constructor TResponseCookie.Create(const ACookieData, ADomain: string);
   var
     LMaxAge: Integer;
   begin
-    if TryStrToInt(AValue, LMaxAge) then
+    if _TryParseCookieMaxAge(AValue, LMaxAge) then
       Self.MaxAge := LMaxAge;
   end;
 
   procedure SetPath(const AValue: string);
   begin
-    if (AValue = '') or (AValue[High(AValue)] <> '/') then
-      Self.Path := AValue + '/'
-    else
+    if (AValue <> '') and (AValue[1] = '/') and _IsCookieAvValue(AValue) then
       Self.Path := AValue;
   end;
 
   procedure SetDomain(const AValue: string);
+  var
+    LDomain: string;
   begin
-    if (AValue <> '') then
-      Self.Domain := AValue;
+    LDomain := _NormalizeCookieDomain(AValue);
+    if (LDomain <> '') then
+      Self.Domain := LDomain;
   end;
 
 var
@@ -1685,6 +1948,14 @@ var
   LName: string;
   LValue: string;
 begin
+  Self.Name := '';
+  Self.Value := '';
+  Self.MaxAge := 0;
+  Self.Path := '/';
+  Self.Domain := _NormalizeCookieDomain(ADomain);
+  Self.HttpOnly := False;
+  Self.Secure := False;
+
   LValues := ACookieData.Split([Char(';')], Char('"'));
   if Length(LValues) = 0 then Exit;
 
@@ -1692,9 +1963,13 @@ begin
   if (LPos <= 0) then Exit;
 
   Self.Name := LValues[0].Substring(0, LPos).Trim;
-  Self.Value := TCrossHttpUtils.UrlDecode(LValues[0].Substring(LPos + 1).Trim);
-  Self.Path := '/';
-  Self.Domain := ADomain;
+  if not _IsHttpToken(Self.Name)
+    or not _TryNormalizeCookieValue(LValues[0].Substring(LPos + 1).Trim, Self.Value) then
+  begin
+    Self.Name := '';
+    Self.Value := '';
+    Exit;
+  end;
 
   for I := 1 to High(LValues) do
   begin
@@ -1729,7 +2004,18 @@ end;
 
 function TResponseCookie.Encode: string;
 begin
-  Result := Self.Name + '=' + TCrossHttpUtils.UrlEncode(Self.Value);
+  if not _IsHttpToken(Self.Name) then
+    raise Exception.CreateFmt('Invalid cookie name: %s', [Self.Name]);
+  if not _IsCookieOctets(Self.Value) then
+    raise Exception.CreateFmt('Invalid cookie value: %s', [Self.Name]);
+  if not _IsCookieAvValue(Self.Path) then
+    raise Exception.CreateFmt('Invalid cookie path: %s', [Self.Name]);
+  if (Self.Path <> '') and (Self.Path[1] <> '/') then
+    raise Exception.CreateFmt('Invalid cookie path: %s', [Self.Name]);
+  if not _IsCookieAvValue(Self.Domain) then
+    raise Exception.CreateFmt('Invalid cookie domain: %s', [Self.Name]);
+
+  Result := Self.Name + '=' + Self.Value;
 
   if (Self.MaxAge > 0) then
     Result := Result + '; Max-Age=' + Self.MaxAge.ToString;

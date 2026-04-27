@@ -361,22 +361,30 @@ procedure TIocpCrossSocket.StopLoop;
   // 而这时候有可能还有部分操作未完成, 其对应的 PerIoData 结构就无法释放
   // 只需要在这里再次接收完成端口的消息, 就能等到这部分未完成的操作超时或失败
   // 从而释放其对应的 PerIoData 结构
+  //
+  // 超时仍未清零时: 输出错误日志诊断遗留, 仍关闭 IOCP handle (避免 OS 句柄泄漏).
+  // 因 IO 线程已退出, 此处与 _HandleXxx 路径互斥, 无 PerIoData 重复释放风险.
   procedure _FreeMissingPerIoDatas;
+  const
+    DEFAULT_DRAIN_TIMEOUT_MS = 3000;
+    POLL_STEP_MS = 10;
   var
     LBytes: Cardinal;
     LSocket: TSocket;
     LPerIoData: PPerIoData;
     LConnection: ICrossConnection;
-    LMaxWait: Integer;
+    LMaxWait, LRemaining: Integer;
   begin
-    LMaxWait := 3000;
-    while (AtomicCmpExchange(FPerIoDataCount, 0, 0) > 0) and (LMaxWait > 0) do
+    LMaxWait := DEFAULT_DRAIN_TIMEOUT_MS;
+    LRemaining := LMaxWait;
+
+    while (AtomicCmpExchange(FPerIoDataCount, 0, 0) > 0) and (LRemaining > 0) do
     begin
-      GetQueuedCompletionStatus(FIocpHandle, LBytes, ULONG_PTR(LSocket), POverlapped(LPerIoData), 10);
+      GetQueuedCompletionStatus(FIocpHandle, LBytes, ULONG_PTR(LSocket), POverlapped(LPerIoData), POLL_STEP_MS);
 
       if (LPerIoData = nil) then
       begin
-        Dec(LMaxWait, 10);
+        Dec(LRemaining, POLL_STEP_MS);
         Continue;
       end;
 
@@ -400,6 +408,11 @@ procedure TIocpCrossSocket.StopLoop;
         _FreeIoData(LPerIoData);
       end;
     end;
+
+    // 超时仍未清零: 不静默, 强制 _Log (受 CrossSocketLogEnabled 全局开关控制)
+    if (AtomicCmpExchange(FPerIoDataCount, 0, 0) > 0) then
+      _Log('[%s][StopLoop] WARNING: drain 超时 %dms, 仍有 %d 个 PerIoData 未回收, 即将关闭 IOCP handle',
+        [Self.ClassName, LMaxWait, AtomicCmpExchange(FPerIoDataCount, 0, 0)]);
   end;
 
 var
