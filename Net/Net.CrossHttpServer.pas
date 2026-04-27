@@ -2019,10 +2019,9 @@ type
     procedure SetStatusCode(Value: Integer);
     procedure SetStatusText(const Value: string);
   public
-    constructor Create(const AConnection: TCrossHttpConnection); overload;
     constructor Create(const AConnection: TCrossHttpConnection;
       const ARequest: ICrossHttpRequest;
-      const AQueueItem: IHttpResponseQueueItem); overload;
+      const AQueueItem: IHttpResponseQueueItem);
     destructor Destroy; override;
   end;
 
@@ -4541,12 +4540,6 @@ begin
 end;
 
 { TCrossHttpResponse }
-
-constructor TCrossHttpResponse.Create(const AConnection: TCrossHttpConnection);
-begin
-  // 兼容入口: 沿用连接当前的 FRequest, 不绑定 queue item
-  Create(AConnection, AConnection.FRequest, nil);
-end;
 
 constructor TCrossHttpResponse.Create(const AConnection: TCrossHttpConnection;
   const ARequest: ICrossHttpRequest;

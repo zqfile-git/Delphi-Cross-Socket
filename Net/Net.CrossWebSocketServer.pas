@@ -371,6 +371,7 @@ type
     FOnPongEventsLock: ILock;
 
     procedure _WebSocketHandshake(const AConnection: ICrossWebSocketConnection;
+      const ARequest: ICrossHttpRequest; const AResponse: ICrossHttpResponse;
       const ACallback: TWsServerCallback);
 
     procedure _OnOpen(const AConnection: ICrossWebSocketConnection);
@@ -950,6 +951,7 @@ end;
 
 procedure TCrossWebSocketServer._WebSocketHandshake(
   const AConnection: ICrossWebSocketConnection;
+  const ARequest: ICrossHttpRequest; const AResponse: ICrossHttpResponse;
   const ACallback: TWsServerCallback);
 begin
   {
@@ -958,11 +960,11 @@ begin
     Connection: Upgrade
     Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=
   }
-  AConnection.Response.Header[HEADER_UPGRADE] := WEBSOCKET;
-  AConnection.Response.Header[HEADER_CONNECTION] := HEADER_UPGRADE;
-  AConnection.Response.Header[HEADER_SEC_WEBSOCKET_ACCEPT] :=
-    TCrossWebSocketParser.MakeSecWebSocketAccept(AConnection.Request.Header[HEADER_SEC_WEBSOCKET_KEY]);
-  AConnection.Response.SendStatus(101, '',
+  AResponse.Header[HEADER_UPGRADE] := WEBSOCKET;
+  AResponse.Header[HEADER_CONNECTION] := HEADER_UPGRADE;
+  AResponse.Header[HEADER_SEC_WEBSOCKET_ACCEPT] :=
+    TCrossWebSocketParser.MakeSecWebSocketAccept(ARequest.Header[HEADER_SEC_WEBSOCKET_KEY]);
+  AResponse.SendStatus(101, '',
     procedure(const AConnection: ICrossConnection; const ASuccess: Boolean)
     begin
       if Assigned(ACallback) then
@@ -1007,7 +1009,7 @@ begin
     and ContainsText(ARequest.Header[HEADER_CONNECTION], HEADER_UPGRADE) then
   begin
     LConnectionObj.FIsWebSocket := True;
-    _WebSocketHandshake(LConnection,
+    _WebSocketHandshake(LConnection, ARequest, AResponse,
       procedure(const AConnection: ICrossWebSocketConnection; const ASuccess: Boolean)
       begin
         if ASuccess then
